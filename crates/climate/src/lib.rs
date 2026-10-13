@@ -892,10 +892,29 @@ impl Climate {
     /// sea level). Cells that became ocean take their soil water and snow into
     /// the sea; cells that became land turn their sea ice into snow. Rivers
     /// are re-routed.
-    pub fn terrain_changed(&mut self, grid: &GeodesicGrid, terrain: &Terrain, was_ocean: &[bool]) {
+    pub fn terrain_changed(
+        &mut self,
+        grid: &GeodesicGrid,
+        planet: &PlanetParams,
+        before: &Terrain,
+        terrain: &Terrain,
+    ) {
+        // Air temperature follows height: a cell lifted by Δh is Γ·Δh colder
+        // (its sea-level-equivalent temperature is unchanged), so new
+        // mountains are cold and new basins warm without inventing heat.
+        let lapse = self.params.lapse_rate * planet.body.gravity() / EARTH_GRAVITY;
+        let land_height = |t: &Terrain, c: CellId| {
+            if t.is_ocean(c) {
+                0.0
+            } else {
+                t.height_above_sea(c).max(0.0)
+            }
+        };
+        let was_ocean = before.ocean_mask();
         for c in grid.cells() {
             let i = c as usize;
             let area = self.geo.area[i];
+            self.temperature[i] -= lapse * (land_height(terrain, c) - land_height(before, c));
             let now_ocean = terrain.is_ocean(c);
             if now_ocean && !was_ocean[i] {
                 self.ocean_water +=
@@ -908,6 +927,24 @@ impl Climate {
             } else if !now_ocean && was_ocean[i] {
                 self.snow[i] += self.sea_ice[i] * ICE_DENSITY;
                 self.sea_ice[i] = 0.0;
+            }
+        }
+        // Re-diagnose last year's climate zones where the ground moved, using
+        // the same lapse-rate shift, so the zone map responds at once.
+        if let Some(year) = &mut self.stats.last_year {
+            for c in grid.cells() {
+                let i = c as usize;
+                let dh = land_height(terrain, c) - land_height(before, c);
+                if dh != 0.0 || was_ocean[i] != terrain.is_ocean(c) {
+                    for t in year.temperature[i].iter_mut() {
+                        *t -= (lapse * dh) as f32;
+                    }
+                    year.zones[i] = stats::classify(
+                        &year.temperature[i],
+                        &year.precipitation[i],
+                        terrain.is_ocean(c),
+                    );
+                }
             }
         }
         self.drainage = Drainage::build(grid, terrain);
@@ -1099,6 +1136,34 @@ pub fn spin_up(
         fine.cloud[i] = coarse.cloud[ki];
         fine.precipitation[i] = coarse.precipitation[ki];
     }
+    // Carry the last simulated year over too, so yearly statistics and
+    // climate zones are available from the start.
+    if let Some(year) = &coarse.stats.last_year {
+        let temperature: Vec<[f32; 12]> = grid
+            .cells()
+            .map(|c| {
+                let k = owner[c as usize];
+                let dh = land_height(terrain, c) - land_height(&coarse_terrain, k);
+                year.temperature[k as usize].map(|t| t - (lapse * dh) as f32)
+            })
+            .collect();
+        let precipitation: Vec<[f32; 12]> = grid
+            .cells()
+            .map(|c| year.precipitation[owner[c as usize] as usize])
+            .collect();
+        let zones = grid
+            .cells()
+            .map(|c| {
+                let i = c as usize;
+                stats::classify(&temperature[i], &precipitation[i], terrain.is_ocean(c))
+            })
+            .collect();
+        fine.stats.last_year = Some(YearSummary {
+            temperature,
+            precipitation,
+            zones,
+        });
+    }
     // The mapped state defines the new water baseline.
     fine.ocean_water = 0.0;
     progress(1.0);
@@ -1144,5 +1209,11 @@ mod spin_up_tests {
             / (4.0 * std::f64::consts::PI);
         assert!((280.0..295.0).contains(&mean), "{mean}");
         assert!(climate.temperature.iter().all(|t| t.is_finite()));
+        let year = climate
+            .stats
+            .last_year
+            .as_ref()
+            .expect("year statistics carried over");
+        assert_eq!(year.zones.len(), grid.cell_count());
     }
 }

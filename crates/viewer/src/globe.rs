@@ -42,6 +42,7 @@ flat in float v_hovered;
 uniform vec3 u_eye;
 uniform vec3 u_sun;
 uniform float u_sunlit;
+uniform float u_night;
 uniform float u_borders;
 uniform float u_relief;
 uniform vec4 u_brush;
@@ -58,13 +59,13 @@ void main() {
     // normal, so mountains don't light up at night); relief adds shading.
     float day = smoothstep(-0.08, 0.35, dot(up, u_sun));
     float shade = 0.75 + 0.25 * clamp(dot(n, u_sun) / max(dot(up, u_sun), 0.2), 0.0, 1.6);
-    float sunlit = (0.38 + 0.62 * day) * mix(1.0, shade, u_relief * day);
+    float sunlit = (u_night + (1.0 - u_night) * day) * mix(1.0, shade, u_relief * day);
     float even = 0.6 + 0.4 * max(dot(n, view), 0.0);
     vec3 colour = v_colour * mix(even, sunlit, u_sunlit);
 
     float w = fwidth(v_edge);
     float border = smoothstep(1.0 - 1.6 * w, 1.0 - 0.4 * w, v_edge);
-    colour = mix(colour, colour * 0.45, border * u_borders);
+    colour = mix(colour, colour * 0.6, border * u_borders);
 
     if (v_hovered > 0.5) {
         colour = mix(colour, vec3(1.0), 0.3 + 0.5 * border);
@@ -175,6 +176,8 @@ pub struct FrameUniforms {
     pub eye: V3,
     pub sun: V3,
     pub sunlit: bool,
+    /// Brightness of the night side (0–1).
+    pub night: f32,
     pub borders: f32,
     pub relief: f32,
     pub hovered: Option<CellId>,
@@ -331,6 +334,7 @@ impl GlobeRenderer {
             gl.uniform_3_f32(loc("u_eye").as_ref(), u.eye.0, u.eye.1, u.eye.2);
             gl.uniform_3_f32(loc("u_sun").as_ref(), u.sun.0, u.sun.1, u.sun.2);
             gl.uniform_1_f32(loc("u_sunlit").as_ref(), if u.sunlit { 1.0 } else { 0.0 });
+            gl.uniform_1_f32(loc("u_night").as_ref(), u.night);
             gl.uniform_1_f32(loc("u_borders").as_ref(), u.borders);
             gl.uniform_1_f32(loc("u_relief").as_ref(), u.relief);
             gl.uniform_1_f32(

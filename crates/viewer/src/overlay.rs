@@ -463,7 +463,14 @@ fn satellite(state: &WorldState, i: usize) -> Rgb {
         let river = log_scale(c.river_flow[i] as f32, 2_000.0, 200_000.0);
         lerp(ground, hex(0x2f6d8f), river * 0.8)
     };
-    lerp(surface, hex(0xf4f6f8), (c.cloud[i] as f32 * 0.7).powf(1.3))
+    // Only properly cloudy skies show, so storm belts and clear deserts stand out.
+    let cloud = c.cloud[i] as f32;
+    let cover = ((cloud - 0.5) / 0.45).clamp(0.0, 1.0);
+    lerp(
+        surface,
+        hex(0xf4f6f8),
+        cover * cover * (3.0 - 2.0 * cover) * 0.85,
+    )
 }
 
 /// Text for one cell's overlay value.

@@ -342,23 +342,29 @@ impl World {
 
     /// Terraforms with a brush. Returns the cells that changed.
     pub fn apply_brush(&mut self, brush: &Brush) -> Vec<CellId> {
-        let was_ocean = self.state.terrain.ocean_mask().to_vec();
+        let before = self.state.terrain.clone();
         let changed = self.state.terrain.apply_brush(&self.state.grid, brush);
         if !changed.is_empty() {
-            self.state
-                .climate
-                .terrain_changed(&self.state.grid, &self.state.terrain, &was_ocean);
+            self.state.climate.terrain_changed(
+                &self.state.grid,
+                &self.state.planet,
+                &before,
+                &self.state.terrain,
+            );
         }
         changed
     }
 
     /// Moves the sea level, flooding or draining the planet.
     pub fn set_sea_level(&mut self, level: f64) {
-        let was_ocean = self.state.terrain.ocean_mask().to_vec();
+        let before = self.state.terrain.clone();
         self.state.terrain.set_sea_level(&self.state.grid, level);
-        self.state
-            .climate
-            .terrain_changed(&self.state.grid, &self.state.terrain, &was_ocean);
+        self.state.climate.terrain_changed(
+            &self.state.grid,
+            &self.state.planet,
+            &before,
+            &self.state.terrain,
+        );
     }
 
     /// Changes the player's evolution-speed settings; takes effect immediately.

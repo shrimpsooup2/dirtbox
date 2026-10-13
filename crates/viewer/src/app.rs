@@ -772,11 +772,18 @@ impl DirtboxApp {
             eye: self.camera.eye(),
             sun: (sun.x as f32, sun.y as f32, sun.z as f32),
             sunlit: self.sunlit,
+            // Data overlays stay readable on the night side; the satellite
+            // view shows a real night.
+            night: if self.overlay == Overlay::Satellite {
+                0.3
+            } else {
+                0.75
+            },
             borders: if self.borders {
                 let cells_across = (state.grid.cell_count() as f32).sqrt();
                 let px_per_cell =
                     rect.height() / cells_across * (2.2 / (self.camera.altitude() + 0.2));
-                ((px_per_cell - 4.0) / 8.0).clamp(0.0, 1.0)
+                ((px_per_cell - 10.0) / 12.0).clamp(0.0, 1.0)
             } else {
                 0.0
             },

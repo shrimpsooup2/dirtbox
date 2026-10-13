@@ -39,7 +39,9 @@ pub fn optical_depth(atm: &Atmosphere, column_water: f64, cloud_fraction: f64) -
     let broadening = p.max(1e-6).powf(0.6);
     let co2 = 0.08 * (1.0 + atm.co2 / 4e-5).ln() * broadening;
     let ch4 = 0.01 * (1.0 + atm.ch4 / 1e-7).ln() * broadening;
-    let h2o = 0.094 * column_water.max(0.0).sqrt() * p.max(1e-6).powf(0.3);
+    // W^0.35 rather than √W: a gentler water-vapour feedback that stands in for
+    // the offsetting lapse-rate feedback a single-layer model lacks.
+    let h2o = 0.152 * column_water.max(0.0).powf(0.35) * p.max(1e-6).powf(0.3);
     let cloud = 0.35 * cloud_fraction;
     co2 + ch4 + h2o + cloud
 }

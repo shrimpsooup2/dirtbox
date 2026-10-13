@@ -242,7 +242,7 @@ fn water_is_conserved_and_terraforming_reshapes_climate() {
         })
         .unwrap();
     let centre: Vec3 = run.grid.position(target);
-    let was_ocean = run.terrain.ocean_mask().to_vec();
+    let before = run.terrain.clone();
     run.terrain.apply_brush(
         &run.grid,
         &dirtbox_planet::Brush {
@@ -253,7 +253,7 @@ fn water_is_conserved_and_terraforming_reshapes_climate() {
         },
     );
     run.climate
-        .terrain_changed(&run.grid, &run.terrain, &was_ocean);
+        .terrain_changed(&run.grid, &run.planet, &before, &run.terrain);
     assert!(!run.terrain.is_ocean(target));
     run.years(1.2);
     let peak = run.climate.temperature[target as usize];
@@ -265,4 +265,18 @@ fn water_is_conserved_and_terraforming_reshapes_climate() {
         peak < sea - 25.0,
         "plateau {peak:.1} K vs tropical sea {sea:.1} K"
     );
+}
+
+#[test]
+fn doubling_co2_warms_by_a_realistic_amount() {
+    let mean_after = |co2_bar: f64| {
+        let mut planet = Preset::EarthModern.params();
+        planet.atmosphere.co2 = co2_bar;
+        let mut run = Run::new(16, planet, None, false);
+        run.years(12.0);
+        run.climate.summary(&run.grid, &run.terrain).mean_temperature
+    };
+    let warming = mean_after(560e-6) - mean_after(280e-6);
+    // Observed equilibrium climate sensitivity: likely 2.5–4 K, very likely 2–5 K.
+    assert!((2.0..5.0).contains(&warming), "doubling CO₂ warmed by {warming:.2} K");
 }
