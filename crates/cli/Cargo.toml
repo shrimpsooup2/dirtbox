@@ -1,0 +1,16 @@
+[package]
+name = "dirtbox-cli"
+description = "Headless command-line runner for Dirtbox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "dirtbox"
+path = "src/main.rs"
+
+[dependencies]
+dirtbox-core.workspace = true
+dirtbox-grid.workspace = true
+dirtbox-sim.workspace = true
+dirtbox-hw.workspace = true

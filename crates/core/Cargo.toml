@@ -1,0 +1,6 @@
+[package]
+name = "dirtbox-core"
+description = "Units, constants, clocks, deterministic RNG and sphere math for Dirtbox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true

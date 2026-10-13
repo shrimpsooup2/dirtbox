@@ -1,0 +1,9 @@
+[package]
+name = "dirtbox-hw"
+description = "Hardware detection, calibration benchmark and population budget recommendation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dirtbox-core.workspace = true

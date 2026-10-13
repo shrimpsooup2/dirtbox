@@ -1,0 +1,10 @@
+[package]
+name = "dirtbox-sim"
+description = "World state, multi-rate scheduler and state hashing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dirtbox-core.workspace = true
+dirtbox-grid.workspace = true

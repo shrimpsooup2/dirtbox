@@ -1,0 +1,9 @@
+[package]
+name = "dirtbox-grid"
+description = "Geodesic hex grid over the planet surface"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dirtbox-core.workspace = true
