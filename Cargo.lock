@@ -424,6 +424,7 @@ dependencies = [
  "dirtbox-core",
  "dirtbox-grid",
  "dirtbox-hw",
+ "dirtbox-organism",
  "dirtbox-planet",
  "dirtbox-sim",
 ]
@@ -457,6 +458,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dirtbox-organism"
+version = "0.1.0"
+dependencies = [
+ "dirtbox-chemistry",
+ "dirtbox-climate",
+ "dirtbox-core",
+ "dirtbox-grid",
+ "dirtbox-planet",
+ "rayon",
+]
+
+[[package]]
 name = "dirtbox-planet"
 version = "0.1.0"
 dependencies = [
@@ -472,6 +485,7 @@ dependencies = [
  "dirtbox-climate",
  "dirtbox-core",
  "dirtbox-grid",
+ "dirtbox-organism",
  "dirtbox-planet",
 ]
 

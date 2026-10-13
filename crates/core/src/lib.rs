@@ -4,6 +4,7 @@
 //! All quantities are SI unless a name says otherwise.
 
 pub mod consts;
+pub mod lineage;
 pub mod math;
 pub mod rng;
 pub mod time;

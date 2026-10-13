@@ -5,6 +5,7 @@ use std::time::Instant;
 use dirtbox_chemistry::{Milestone, Module, pool};
 use dirtbox_climate::StepMode;
 use dirtbox_core::SimTime;
+use dirtbox_organism::{GrowthForm, PlantGenome};
 use dirtbox_planet::Preset;
 use dirtbox_sim::{EvolutionSettings, World, WorldConfig};
 
@@ -18,6 +19,9 @@ pub struct LifeRun {
     pub structural: f64,
     pub until: Option<Milestone>,
     pub report_years: f64,
+    /// Plant these on every land cell at the start: moss, grass, tree or mix.
+    pub plants: Option<String>,
+    pub time_lapse: Option<f64>,
 }
 
 pub fn milestone_by_name(name: &str) -> Result<Milestone, String> {
@@ -54,6 +58,25 @@ pub fn run(cfg: LifeRun) -> Result<(), String> {
     let mut world = World::with_spin_up(config, 3.0, &mut |_| {})?;
     world.set_climate_mode(StepMode::DailyMean);
     world.set_climate_stride(cfg.stride);
+    if let Some(t) = cfg.time_lapse {
+        world.state_mut().set_vegetation_time_lapse(t);
+    }
+    if let Some(kind) = &cfg.plants {
+        let genomes = match kind.as_str() {
+            "moss" => vec![PlantGenome::moss()],
+            "grass" => vec![PlantGenome::grass()],
+            "tree" => vec![PlantGenome::tree()],
+            "mix" => vec![PlantGenome::moss(), PlantGenome::grass(), PlantGenome::tree()],
+            other => return Err(format!("unknown plants `{other}`: moss, grass, tree or mix")),
+        };
+        let land: Vec<u32> = {
+            let s = world.state();
+            s.grid.cells().filter(|&c| !s.terrain.is_ocean(c)).collect()
+        };
+        for g in genomes {
+            world.state_mut().introduce_plants(&land, g, 0.05);
+        }
+    }
     let s = world.state();
     println!(
         "{} · {} cells · climate every {} day(s) · spin-up {:.1} s",
@@ -110,6 +133,25 @@ pub fn run(cfg: LifeRun) -> Result<(), String> {
             summary.mean_temperature - 273.15,
             mods.join(", ")
         );
+        let v = s.vegetation.stats();
+        if v.biomass > 0.0 {
+            let forms: Vec<String> = GrowthForm::ALL
+                .iter()
+                .zip(v.form_biomass)
+                .filter(|x| x.1 > 0.0)
+                .map(|(f, b)| format!("{} {:.0}%", f.label(), 100.0 * b / v.biomass))
+                .collect();
+            println!(
+                "        plants: {:.3e} mol C · green land {:.0}% · forest {:.0}% · tallest {:.1} m · {} lineages · NPP {:.2e}/plant-yr · {}",
+                v.biomass,
+                100.0 * v.green_land,
+                100.0 * v.forest_land,
+                v.tallest,
+                v.lineages,
+                v.npp,
+                forms.join(", ")
+            );
+        }
         for e in &life.events()[printed_events..] {
             println!(
                 "        ★ year {:.1} (≈{:.0} kyr of evolution): {}",
@@ -125,7 +167,7 @@ pub fn run(cfg: LifeRun) -> Result<(), String> {
             println!("Reached “{}”.", m.label());
             break;
         }
-        if !life.is_alive() && life.has_reached(Milestone::LifeBegins) {
+        if !life.is_alive() && life.has_reached(Milestone::LifeBegins) && !s.vegetation.is_alive() {
             println!("Life died out.");
             break;
         }
@@ -145,6 +187,46 @@ pub fn run(cfg: LifeRun) -> Result<(), String> {
         mean(pool::NITROGEN),
         mean(pool::PHOSPHORUS)
     );
+    let land_cells: Vec<u32> = s.grid.cells().filter(|&c| !s.terrain.is_ocean(c)).collect();
+    let land_mean = |k: usize| {
+        land_cells.iter().map(|&c| s.life.pool(c, k)).sum::<f64>() / land_cells.len().max(1) as f64
+    };
+    println!(
+        "Soil means (mol/m²): organics {:.3e} · N {:.3e} · P {:.3e}",
+        land_mean(pool::ORGANICS),
+        land_mean(pool::NITROGEN),
+        land_mean(pool::PHOSPHORUS)
+    );
+    if s.vegetation.is_alive()
+        && let Some(year) = &s.climate.stats.last_year
+    {
+        println!("Vegetation by climate zone (land):");
+        let mut zones: Vec<_> = year.zones.iter().copied().collect();
+        zones.sort_by_key(|z| z.label());
+        zones.dedup();
+        for z in zones {
+            let cells: Vec<u32> = land_cells
+                .iter()
+                .copied()
+                .filter(|&c| year.zones[c as usize] == z)
+                .collect();
+            if cells.is_empty() {
+                continue;
+            }
+            let k = cells.len() as f64;
+            let lai = cells.iter().map(|&c| s.vegetation.leaf_area()[c as usize]).sum::<f64>() / k;
+            let height = cells.iter().map(|&c| s.vegetation.canopy_height(c)).sum::<f64>() / k;
+            let bio = cells.iter().map(|&c| s.vegetation.biomass(c)).sum::<f64>() / k;
+            println!(
+                "  {:<14} {:>5} cells · LAI {:>5.2} · canopy {:>5.1} m · {:>8.1} mol C/m²",
+                z.label(),
+                cells.len(),
+                lai,
+                height,
+                bio
+            );
+        }
+    }
     let st = s.life.stats();
     println!(
         "Productivity {:.2e} mol C/yr · organics {:.2e} mol · buried {:.2e} mol · strains ever {} · wall {:.1} s",

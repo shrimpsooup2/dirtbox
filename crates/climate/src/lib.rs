@@ -40,6 +40,9 @@ pub use wind::CirculationSummary;
 use physics::*;
 pub use transport::Geometry;
 
+/// Albedo of a closed plant canopy.
+const ALBEDO_VEGETATION: f64 = 0.14;
+
 /// How often the circulation is recomputed, planet s.
 const WIND_INTERVAL: f64 = 6.0 * 3600.0;
 
@@ -207,6 +210,10 @@ pub struct Climate {
     pub evaporation: Vec<f64>,
     /// River discharge leaving each cell, m³ s⁻¹ (updated once per planet day).
     pub river_flow: Vec<f64>,
+    /// Leaf area index of the vegetation on each cell (m² of leaves per m²),
+    /// set by the producers. Plants darken the land and pump soil water into
+    /// the air.
+    pub canopy: Vec<f64>,
     pub circulation: CirculationSummary,
     orographic: Vec<f64>,
     time_since_wind: f64,
@@ -302,6 +309,7 @@ impl Climate {
             precipitation: vec![0.0; n],
             evaporation: vec![0.0; n],
             river_flow: vec![0.0; n],
+            canopy: vec![0.0; n],
             circulation: CirculationSummary::default(),
             orographic: Vec::new(),
             time_since_wind: 0.0,
@@ -465,8 +473,12 @@ impl Climate {
             } else {
                 let wet = (self.soil[i] / p.soil_capacity).clamp(0.0, 1.0);
                 let bare = p.albedo_land_dry + wet * (p.albedo_land_wet - p.albedo_land_dry);
-                let snow_cover = (self.snow[i] / 50.0).clamp(0.0, 1.0);
-                bare + snow_cover * (p.albedo_snow - bare)
+                let leaves = self.canopy.get(i).copied().unwrap_or(0.0);
+                let cover = 1.0 - (-0.5 * leaves).exp();
+                let ground = bare + cover * (ALBEDO_VEGETATION - bare);
+                // Snow on the ground shows less through a canopy.
+                let snow_cover = (self.snow[i] / 50.0).clamp(0.0, 1.0) * (1.0 - 0.6 * cover);
+                ground + snow_cover * (p.albedo_snow - ground)
             };
             let albedo = rayleigh
                 + (1.0 - rayleigh)
@@ -500,8 +512,11 @@ impl Climate {
                 self.snow[i] -= e * dt;
                 (e, LATENT_VAPORISATION + LATENT_FUSION)
             } else {
-                let e = (potential * (self.soil[i] / p.soil_capacity).clamp(0.0, 1.0))
-                    .min(self.soil[i] / dt);
+                // Roots draw water from deeper down: transpiration keeps
+                // going as the topsoil dries.
+                let leaves = self.canopy.get(i).copied().unwrap_or(0.0);
+                let access = ((self.soil[i] / p.soil_capacity) * (1.0 + 0.5 * leaves)).clamp(0.0, 1.0);
+                let e = (potential * access).min(self.soil[i] / dt);
                 self.soil[i] -= e * dt;
                 (e, LATENT_VAPORISATION)
             };

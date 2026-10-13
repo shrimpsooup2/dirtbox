@@ -48,6 +48,8 @@ COMMANDS:
                    --structural <x>     structural-mutation multiplier (default 1)
                    --until <milestone>  stop at a milestone, e.g. oxygenic, 'oxygen in', phago
                    --report-years <y>   print a line every y planet years (default 5)
+                   --plants <kind>      plant moss, grass, tree or mix on all land at the start
+                   --time-lapse <x>     plant years per planet year (default 20)
     help         Show this message
 ";
 
@@ -88,6 +90,8 @@ fn main() -> ExitCode {
                 "structural",
                 "until",
                 "report-years",
+                "plants",
+                "time-lapse",
             ],
         )
         .and_then(life),
@@ -382,5 +386,7 @@ fn life(o: Options) -> Result<(), String> {
         structural: o.get("structural")?.unwrap_or(1.0),
         until,
         report_years: o.get("report-years")?.unwrap_or(5.0),
+        plants: o.get("plants")?,
+        time_lapse: o.get("time-lapse")?,
     })
 }

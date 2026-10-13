@@ -113,6 +113,10 @@ pub struct Genome {
     pub adhesion: f32,
     /// Toxin production, 0–1: kills competitors in the same place; costs energy.
     pub toxin: f32,
+    /// Cells specialising into types, 0–1 (e.g. heterocysts that fix
+    /// nitrogen away from the oxygen photosynthesis makes). With adhesion, the
+    /// road to multicellular life. Costs energy.
+    pub differentiation: f32,
     /// Built from two cells by endosymbiosis.
     pub complex: bool,
 }
@@ -133,6 +137,7 @@ impl Genome {
             dormancy: 0.05,
             adhesion: 0.0,
             toxin: 0.0,
+            differentiation: 0.0,
             complex: false,
         }
     }
@@ -154,6 +159,12 @@ impl Genome {
     }
 
     /// Bitmask of modules present (bit = module index).
+    /// How far along the road to multicellularity: sticky cells that
+    /// specialise, 0–1.
+    pub fn colony(&self) -> f64 {
+        (self.adhesion * self.differentiation) as f64
+    }
+
     pub fn module_mask(&self) -> u8 {
         Module::ALL
             .iter()
@@ -184,6 +195,7 @@ impl Genome {
             + (self.dormancy - o.dormancy).abs() as f64
             + (self.adhesion - o.adhesion).abs() as f64
             + (self.toxin - o.toxin).abs() as f64
+            + (self.differentiation - o.differentiation).abs() as f64
     }
 
     /// A copy with small random changes to existing genes.
@@ -208,13 +220,11 @@ impl Genome {
                 5 => g.size = (g.size * (n(rng, 0.12) as f64).exp() as f32).clamp(0.3, 30.0),
                 6 => g.motility = (g.motility + n(rng, 0.05)).clamp(0.0, 1.0),
                 7 => g.dormancy = (g.dormancy + n(rng, 0.05)).clamp(0.0, 1.0),
-                _ => {
-                    if rng.chance(0.5) {
-                        g.adhesion = (g.adhesion + n(rng, 0.05)).clamp(0.0, 1.0);
-                    } else {
-                        g.toxin = (g.toxin + n(rng, 0.05)).clamp(0.0, 1.0);
-                    }
-                }
+                _ => match rng.below(3) {
+                    0 => g.adhesion = (g.adhesion + n(rng, 0.05)).clamp(0.0, 1.0),
+                    1 => g.toxin = (g.toxin + n(rng, 0.05)).clamp(0.0, 1.0),
+                    _ => g.differentiation = (g.differentiation + n(rng, 0.05)).clamp(0.0, 1.0),
+                },
             }
         }
         g

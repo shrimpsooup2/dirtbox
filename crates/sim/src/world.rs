@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use dirtbox_chemistry::{Biosphere, Environment, LifeParams, Milestone, MutationRates};
 use dirtbox_climate::{Climate, ClimateParams, StepInputs, StepMode};
+use dirtbox_organism::{PlantGenome, Vegetation, VegetationParams};
 use dirtbox_core::{Calendar, PlanetClock, Rng, SimTime, TimeModel};
 use dirtbox_grid::CellId;
 use dirtbox_grid::GeodesicGrid;
@@ -34,6 +35,7 @@ pub struct WorldConfig {
     pub life: LifeParams,
     /// Natural mutation rates of microbes, before the player's multipliers.
     pub mutation_rates: MutationRates,
+    pub vegetation: VegetationParams,
 }
 
 impl Default for WorldConfig {
@@ -57,6 +59,7 @@ impl WorldConfig {
             seed_life: true,
             life: LifeParams::default(),
             mutation_rates: MutationRates::default(),
+            vegetation: VegetationParams::default(),
         }
     }
 }
@@ -80,6 +83,7 @@ pub struct WorldState {
     pub terrain: Terrain,
     pub climate: Climate,
     pub life: Biosphere,
+    pub vegetation: Vegetation,
 }
 
 impl WorldState {
@@ -160,6 +164,7 @@ impl WorldState {
         h.write_f64(self.planet.atmosphere.o2);
         h.write_f64(self.planet.atmosphere.ch4);
         self.life.hash_words(&mut |w| h.write_u64(w));
+        self.vegetation.hash_words(&mut |w| h.write_u64(w));
     }
 
     /// Advances the climate over `[start, start + dt)` of planet time.
@@ -190,7 +195,32 @@ impl WorldState {
             start,
         };
         let change = self.life.step(&env, dt, geologic_years, &rates);
+        let plants = self.vegetation.step(
+            &env,
+            &mut self.life,
+            dt,
+            geologic_years,
+            self.evolution.mutation_multiplier,
+            self.evolution.structural_multiplier,
+        );
         change.apply(&mut self.planet);
+        plants.apply(&mut self.planet);
+        self.climate.canopy.copy_from_slice(self.vegetation.leaf_area());
+    }
+
+    /// Plants one lineage of a producer genome in each of `cells` (seeding
+    /// tool), drawing its carbon from the air.
+    pub fn introduce_plants(&mut self, cells: &[CellId], genome: PlantGenome, biomass: f64) {
+        let now = self.planet_seconds();
+        self.vegetation
+            .introduce(self.climate.geometry(), cells, genome, biomass, now);
+        self.vegetation.take_pending().apply(&mut self.planet);
+        self.climate.canopy.copy_from_slice(self.vegetation.leaf_area());
+    }
+
+    /// Plant years per planet year (see `VegetationParams::time_lapse`).
+    pub fn set_vegetation_time_lapse(&mut self, years: f64) {
+        self.vegetation.params.time_lapse = years.clamp(1.0, 200.0);
     }
 
     /// Introduces a population of any genome into one cell, drawing its
@@ -352,6 +382,7 @@ impl World {
         );
         let calendar = config.planet.calendar();
         let life = Biosphere::new(&grid, &terrain, &config.planet, config.life, config.seed);
+        let vegetation = Vegetation::new(grid.cell_count(), config.vegetation, config.seed);
         let mut state = WorldState {
             seed: config.seed,
             now: SimTime::ZERO,
@@ -367,6 +398,7 @@ impl World {
             terrain,
             climate,
             life,
+            vegetation,
         };
         if config.seed_life {
             state.seed_life();

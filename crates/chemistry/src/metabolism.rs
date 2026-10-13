@@ -180,6 +180,7 @@ fn upkeep(g: &Genome) -> f64 {
         + 0.15 * g.dormancy as f64
         + 0.2 * g.adhesion as f64
         + 0.4 * g.toxin as f64
+        + 0.15 * g.differentiation as f64
         + 0.1 * (g.module_count().saturating_sub(1)) as f64
         + if g.complex { 0.1 } else { 0.0 }
 }
@@ -261,9 +262,11 @@ pub fn step_cell(
     }
 
     // --- Light: phototrophs shade each other ----------------------------
+    // Colonies (mats, floating filaments) sit on top and catch more of it.
     let photo_weight = |s: usize| {
         let g = genome(s);
         bio[s]
+            * (1.0 + g.colony())
             * (g.efficiency(Module::AnoxygenicPhotosynthesis)
                 + g.efficiency(Module::OxygenicPhotosynthesis))
     };
@@ -323,7 +326,7 @@ pub fn step_cell(
                 / y;
         }
         if total_photo > 0.0 {
-            let share = absorbed_light / total_photo * b * a * env.co2_factor;
+            let share = absorbed_light / total_photo * b * (1.0 + g.colony()) * a * env.co2_factor;
             for (m, mu, slot) in [
                 (
                     Module::AnoxygenicPhotosynthesis,
@@ -347,8 +350,12 @@ pub fn step_cell(
             }
         }
         if g.has(Module::NitrogenFixation) {
-            let inhibition =
-                env.oxygen / (env.oxygen + 0.05) * (1.0 - 0.7 * g.oxygen_tolerance as f64);
+            // Specialised cells (heterocysts) keep oxygen away from nitrogenase,
+            // best when the cells stick together.
+            let shielded = 0.8 * g.differentiation as f64 * (0.3 + 0.7 * g.adhesion as f64);
+            let inhibition = env.oxygen / (env.oxygen + 0.05)
+                * (1.0 - 0.7 * g.oxygen_tolerance as f64)
+                * (1.0 - shielded);
             w[s].fixing = e(Module::NitrogenFixation) * (1.0 - inhibition).max(0.0);
         }
     }
@@ -535,7 +542,10 @@ pub fn step_cell(
         let poison = (toxin_mass - own_toxin) / (total_mass + 0.01);
         let death = BASE_DEATH * (g.size as f64).powf(-0.2) * (1.0 - 0.3 * g.adhesion as f64)
             + COLD_HEAT_DEATH * (1.0 - x.comfort).powi(2) * (1.0 - 0.9 * dormancy)
-            + DROUGHT_DEATH * (1.0 - env.wetness) * (1.0 - 0.9 * dormancy)
+            + DROUGHT_DEATH
+                * (1.0 - env.wetness)
+                * (1.0 - 0.9 * dormancy)
+                * (1.0 - 0.6 * g.adhesion as f64)
             + OXYGEN_DEATH * x.stress_o2 * (1.0 - 0.5 * dormancy)
             + TOXIN_DEATH * poison;
         let upkeep_rate =

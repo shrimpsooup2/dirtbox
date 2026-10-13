@@ -15,6 +15,7 @@ dirtbox-hw = { path = "crates/hw" }
 dirtbox-planet = { path = "crates/planet" }
 dirtbox-climate = { path = "crates/climate" }
 dirtbox-chemistry = { path = "crates/chemistry" }
+dirtbox-organism = { path = "crates/organism" }
 
 [profile.release]
 debug = 1

@@ -166,6 +166,8 @@ pub struct Biosphere {
     time: f64,
     /// Cell latitudes, cached.
     latitudes: Vec<f64>,
+    /// Usable light at the surface in the last step, W m⁻².
+    light: Vec<f64>,
 }
 
 /// What one cell's step hands back to the planet.
@@ -205,9 +207,15 @@ impl Biosphere {
                     p[O2] = o2_column;
                     p[PHOS] = surface_p;
                     p[NIT] = surface_p * n_ratio;
-                } else {
+                } else if anoxic {
+                    // Raw rock: almost nothing for roots yet.
                     p[PHOS] = 0.005;
                     p[NIT] = 0.01;
+                } else {
+                    // An oxygenated world is assumed to have soils built by a
+                    // long history of life.
+                    p[PHOS] = 0.2;
+                    p[NIT] = 3.0;
                 }
                 p
             })
@@ -236,6 +244,7 @@ impl Biosphere {
             extinct: false,
             time: 0.0,
             latitudes: Vec::new(),
+            light: Vec::new(),
         }
     }
 
@@ -266,6 +275,45 @@ impl Biosphere {
     /// A dissolved pool in one cell, mol m⁻² (index from `metabolism`).
     pub fn pool(&self, cell: CellId, pool: usize) -> f64 {
         self.pools[cell as usize][pool]
+    }
+
+    /// Mutable access to every cell's pools, for producers that share them
+    /// (roots taking up nutrients, litter returning them).
+    pub fn pools_mut(&mut self) -> &mut [[f64; POOLS]] {
+        &mut self.pools
+    }
+
+    /// Usable light at each cell's surface in the last step (daily mean),
+    /// W m⁻². Empty before the first step.
+    pub fn light(&self) -> &[f64] {
+        &self.light
+    }
+
+    /// Removes up to `amount` mol C m⁻² of strain `id` from a cell (with the
+    /// nutrients it holds) and returns how much was taken. For colonies that
+    /// leave the strain field to become multicellular organisms.
+    pub fn take_biomass(&mut self, cell: CellId, id: StrainId, amount: f64) -> f64 {
+        let base = cell as usize * SLOTS;
+        let Some(k) = (base..base + SLOTS).find(|&k| self.ids[k] == id) else {
+            return 0.0;
+        };
+        let taken = amount.min(self.bio[k]).max(0.0);
+        self.bio[k] -= taken;
+        if self.bio[k] < MIN_BIOMASS {
+            let rest = self.bio[k].max(0.0);
+            let p = &mut self.pools[cell as usize];
+            p[OM] += rest;
+            p[NIT] += rest * N_PER_C;
+            p[PHOS] += rest * P_PER_C;
+            self.bio[k] = 0.0;
+            self.ids[k] = EMPTY;
+        }
+        taken
+    }
+
+    /// Records a milestone reached outside the biosphere (e.g. by producers).
+    pub fn record_milestone(&mut self, m: Milestone, time: f64) {
+        self.record(m, time);
     }
 
     /// The strains living in a cell with their biomass (mol C m⁻²),
@@ -533,6 +581,7 @@ impl Biosphere {
         let ocean = env.terrain.ocean_mask();
         let ocean_area: f64 = (0..n).filter(|&i| ocean[i]).map(|i| geo.area[i]).sum();
         let light = self.surface_light(env, dt);
+        self.light.clone_from(&light);
         let wet = Self::wetness(env);
         let mixed = self.params.mixed_layer;
         let o2_saturated = O2_SATURATION * mixed * air_oxygen;

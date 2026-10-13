@@ -17,3 +17,4 @@ dirtbox-hw.workspace = true
 dirtbox-planet.workspace = true
 dirtbox-climate.workspace = true
 dirtbox-chemistry.workspace = true
+dirtbox-organism.workspace = true

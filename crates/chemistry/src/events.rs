@@ -17,6 +17,12 @@ pub enum Milestone {
     ComplexCells,
     /// Land holds ≥ 10¹³ mol of living carbon.
     LandColonised,
+    /// A colony of specialised, sticky cells became a multicellular producer.
+    Multicellular,
+    /// Multicellular producers grow on land.
+    PlantsOnLand,
+    /// A canopy at least 10 m tall covers a meaningful area.
+    Forests,
     /// Every living thing died.
     Extinction,
 }
@@ -34,6 +40,9 @@ impl Milestone {
             Milestone::OxygenRich,
             Milestone::ComplexCells,
             Milestone::LandColonised,
+            Milestone::Multicellular,
+            Milestone::PlantsOnLand,
+            Milestone::Forests,
         ]);
         v
     }
@@ -46,6 +55,9 @@ impl Milestone {
             Milestone::OxygenRich => "Oxygen-rich air".into(),
             Milestone::ComplexCells => "Complex cells".into(),
             Milestone::LandColonised => "Life on land".into(),
+            Milestone::Multicellular => "Multicellular life".into(),
+            Milestone::PlantsOnLand => "Plants on land".into(),
+            Milestone::Forests => "Forests".into(),
             Milestone::Extinction => "Extinction".into(),
         }
     }
@@ -82,6 +94,11 @@ impl Milestone {
                 "Complex cells: a predator kept its prey as a partner.".into()
             }
             Milestone::LandColonised => "Microbial crusts spread across the land.".into(),
+            Milestone::Multicellular => {
+                "Multicellular life: a colony of specialised cells becomes one organism.".into()
+            }
+            Milestone::PlantsOnLand => "Plants spread onto the land.".into(),
+            Milestone::Forests => "The first forests: canopies over 10 m tall.".into(),
             Milestone::Extinction => "All life has died out.".into(),
         }
     }

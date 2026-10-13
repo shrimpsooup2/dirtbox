@@ -1676,7 +1676,7 @@ fn strain_details(g: &dirtbox_chemistry::Genome, parent: Option<u64>, born_year:
         .map(|&m| format!("{} {:.0}%", m.label(), g.efficiency(m) * 100.0))
         .collect();
     format!(
-        "{}\nBest at {:.0} °C (±{:.0}) · O₂ tolerance {:.0}%\nSize {:.1} µm · motility {:.0}% · spores {:.0}% · sticky {:.0}% · toxins {:.0}%{}\nArose in year {:.1}{}",
+        "{}\nBest at {:.0} °C (±{:.0}) · O₂ tolerance {:.0}%\nSize {:.1} µm · motility {:.0}% · spores {:.0}% · sticky {:.0}% · toxins {:.0}% · specialised cells {:.0}%{}\nArose in year {:.1}{}",
         modules.join(", "),
         g.temp_optimum - 273.15,
         g.temp_tolerance,
@@ -1686,6 +1686,7 @@ fn strain_details(g: &dirtbox_chemistry::Genome, parent: Option<u64>, born_year:
         g.dormancy * 100.0,
         g.adhesion * 100.0,
         g.toxin * 100.0,
+        g.differentiation * 100.0,
         if g.complex { " · complex cell" } else { "" },
         born_year,
         parent.map_or(String::new(), |p| format!(" from #{p}")),
