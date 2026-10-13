@@ -5,6 +5,7 @@ use dirtbox_grid::GeodesicGrid;
 
 use crate::hash::StateHasher;
 use crate::schedule::{Cadence, Clock, Slot, StepContext, System};
+use crate::settings::{EvolutionSettings, MutationBoost};
 
 #[derive(Clone, Debug)]
 pub struct WorldConfig {
@@ -13,6 +14,7 @@ pub struct WorldConfig {
     pub calendar: Calendar,
     /// Geodesic subdivision for environment fields (10n² + 2 cells).
     pub grid_subdivision: u32,
+    pub evolution: EvolutionSettings,
 }
 
 impl Default for WorldConfig {
@@ -22,6 +24,7 @@ impl Default for WorldConfig {
             time: TimeModel::default(),
             calendar: Calendar::default(),
             grid_subdivision: 64, // 40,962 cells
+            evolution: EvolutionSettings::default(),
         }
     }
 }
@@ -34,6 +37,7 @@ pub struct WorldState {
     time_model: TimeModel,
     calendar: Calendar,
     planet_clock: PlanetClock,
+    evolution: EvolutionSettings,
     pub grid: GeodesicGrid,
 }
 
@@ -52,6 +56,10 @@ impl WorldState {
 
     pub fn calendar(&self) -> &Calendar {
         &self.calendar
+    }
+
+    pub fn evolution(&self) -> &EvolutionSettings {
+        &self.evolution
     }
 
     pub fn planet_seconds(&self) -> f64 {
@@ -73,6 +81,12 @@ impl WorldState {
         h.write_f64(self.planet_seconds());
         h.write_f64(self.planet_clock.season_speed());
         h.write_u64(self.grid.cell_count() as u64);
+        h.write_f64(self.evolution.mutation_multiplier);
+        h.write_f64(self.evolution.structural_multiplier);
+        h.write_u64(match self.evolution.boost {
+            MutationBoost::Environmental => 0,
+            MutationBoost::Fixed => 1,
+        });
     }
 
     /// First sim time strictly after `now` that lands on a multiple of the
@@ -111,6 +125,7 @@ pub struct World {
 impl World {
     pub fn new(config: WorldConfig) -> Result<Self, String> {
         config.time.validate()?;
+        config.evolution.validate()?;
         if config.calendar.day_length <= 0.0 || config.calendar.year_length <= 0.0 {
             return Err("calendar day and year lengths must be > 0".into());
         }
@@ -120,6 +135,7 @@ impl World {
             planet_clock: PlanetClock::new(config.time.season_speed),
             time_model: config.time,
             calendar: config.calendar,
+            evolution: config.evolution,
             grid: GeodesicGrid::new(config.grid_subdivision),
         };
         Ok(Self {
@@ -170,6 +186,13 @@ impl World {
                 slot.next_due = self.state.next_due(cadence, now);
             }
         }
+        Ok(())
+    }
+
+    /// Changes the player's evolution-speed settings; takes effect immediately.
+    pub fn set_evolution(&mut self, evolution: EvolutionSettings) -> Result<(), String> {
+        evolution.validate()?;
+        self.state.evolution = evolution;
         Ok(())
     }
 

@@ -1,0 +1,18 @@
+[package]
+name = "dirtbox-viewer"
+description = "3D globe viewer and player controls for Dirtbox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "dirtbox-viewer"
+path = "src/main.rs"
+
+[dependencies]
+dirtbox-core.workspace = true
+dirtbox-grid.workspace = true
+dirtbox-sim.workspace = true
+dirtbox-hw.workspace = true
+eframe = { version = "0.36.2", default-features = false, features = ["glow", "default_fonts", "x11", "wayland", "persistence"] }
+egui_glow = "0.36.2"

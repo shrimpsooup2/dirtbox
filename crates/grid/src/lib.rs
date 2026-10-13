@@ -26,6 +26,13 @@ pub struct GeodesicGrid {
     neighbour_list: Vec<CellId>,
     /// Cell areas in steradians (sum to 4π).
     areas: Vec<f64>,
+    /// Corners of each cell polygon, as indices into `circumcentres`, in the
+    /// same CSR layout as the neighbours: corner k lies between neighbours
+    /// k and k + 1.
+    corner_list: Vec<u32>,
+    /// Circumcentre of each mesh triangle on the unit sphere; these are the
+    /// Voronoi (cell polygon) corners.
+    circumcentres: Vec<Vec3>,
     /// Triangles of the cell-centre mesh, counter-clockwise seen from outside.
     triangles: Vec<[CellId; 3]>,
     locator: Locator,
@@ -49,13 +56,15 @@ impl GeodesicGrid {
     pub fn new(subdivision: u32) -> Self {
         assert!(subdivision >= 1, "subdivision must be at least 1");
         let (positions, triangles) = build_mesh(subdivision);
-        let (neighbour_offsets, neighbour_list, areas) = build_cells(&positions, &triangles);
+        let cells = build_cells(&positions, &triangles);
         let mut grid = GeodesicGrid {
             subdivision,
             positions,
-            neighbour_offsets,
-            neighbour_list,
-            areas,
+            neighbour_offsets: cells.offsets,
+            neighbour_list: cells.neighbours,
+            areas: cells.areas,
+            corner_list: cells.corners,
+            circumcentres: cells.circumcentres,
             triangles,
             locator: Locator::default(),
         };
@@ -99,6 +108,17 @@ impl GeodesicGrid {
     /// Cell area in steradians.
     pub fn area(&self, cell: CellId) -> f64 {
         self.areas[cell as usize]
+    }
+
+    /// Corners of the cell polygon on the unit sphere, counter-clockwise seen
+    /// from outside.
+    pub fn corners(&self, cell: CellId) -> impl ExactSizeIterator<Item = Vec3> + '_ {
+        let c = cell as usize;
+        let start = self.neighbour_offsets[c] as usize;
+        let end = self.neighbour_offsets[c + 1] as usize;
+        self.corner_list[start..end]
+            .iter()
+            .map(|&t| self.circumcentres[t as usize])
     }
 
     pub fn triangles(&self) -> &[[CellId; 3]] {
@@ -244,8 +264,17 @@ fn slerp(a: Vec3, b: Vec3, t: f64) -> Vec3 {
     (a * (((1.0 - t) * omega).sin() / s) + b * ((t * omega).sin() / s)).normalized()
 }
 
-/// Neighbour rings (CSR) and Voronoi cell areas from the triangle mesh.
-fn build_cells(positions: &[Vec3], triangles: &[[CellId; 3]]) -> (Vec<u32>, Vec<CellId>, Vec<f64>) {
+struct Cells {
+    offsets: Vec<u32>,
+    neighbours: Vec<CellId>,
+    corners: Vec<u32>,
+    areas: Vec<f64>,
+    circumcentres: Vec<Vec3>,
+}
+
+/// Neighbour rings, polygon corners (CSR) and Voronoi cell areas from the
+/// triangle mesh.
+fn build_cells(positions: &[Vec3], triangles: &[[CellId; 3]]) -> Cells {
     let count = positions.len();
     // For each vertex v, map neighbour x → (next neighbour y, triangle index)
     // for every triangle (v, x, y) in counter-clockwise order.
@@ -270,6 +299,7 @@ fn build_cells(positions: &[Vec3], triangles: &[[CellId; 3]]) -> (Vec<u32>, Vec<
 
     let mut offsets = Vec::with_capacity(count + 1);
     let mut list = Vec::with_capacity(count * 6);
+    let mut corners = Vec::with_capacity(count * 6);
     let mut areas = Vec::with_capacity(count);
     offsets.push(0u32);
     for (v, fan) in fans.iter().enumerate() {
@@ -281,6 +311,7 @@ fn build_cells(positions: &[Vec3], triangles: &[[CellId; 3]]) -> (Vec<u32>, Vec<
         for _ in 0..degree {
             let &(_, next, ti) = fan.iter().find(|e| e.0 == current).expect("open fan");
             list.push(current);
+            corners.push(ti as u32);
             // Voronoi cell = union of triangles (centre, cc_k, cc_k+1); the
             // triangle (v, current, next) contributes circumcentre cc_ti, and
             // the following one shares the edge (v, next).
@@ -292,7 +323,13 @@ fn build_cells(positions: &[Vec3], triangles: &[[CellId; 3]]) -> (Vec<u32>, Vec<
         offsets.push(list.len() as u32);
         areas.push(area);
     }
-    (offsets, list, areas)
+    Cells {
+        offsets,
+        neighbours: list,
+        corners,
+        areas,
+        circumcentres,
+    }
 }
 
 /// Regular icosahedron: 12 unit vertices and 20 counter-clockwise faces.
@@ -437,6 +474,25 @@ mod tests {
             // Walking from an arbitrary far hint lands on the same answer.
             let from_far = g.locate_from(0, p);
             assert!((g.position(from_far).dot(p) - best).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn corners_bound_the_cell() {
+        let g = GeodesicGrid::new(5);
+        for c in g.cells() {
+            let p = g.position(c);
+            let corners: Vec<Vec3> = g.corners(c).collect();
+            assert_eq!(corners.len(), g.neighbours(c).len());
+            // Each corner is equidistant from the cell centre and the two
+            // neighbours it sits between (it is their circumcentre).
+            for (k, &q) in corners.iter().enumerate() {
+                let ring = g.neighbours(c);
+                let a = g.position(ring[k]);
+                let b = g.position(ring[(k + 1) % ring.len()]);
+                assert!((q.dot(p) - q.dot(a)).abs() < 1e-12);
+                assert!((q.dot(p) - q.dot(b)).abs() < 1e-12);
+            }
         }
     }
 

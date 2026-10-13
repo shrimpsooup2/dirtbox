@@ -8,8 +8,10 @@
 
 pub mod hash;
 pub mod schedule;
+pub mod settings;
 pub mod world;
 
 pub use hash::StateHasher;
 pub use schedule::{Cadence, Clock, StepContext, System};
+pub use settings::{EvolutionSettings, MutationBoost};
 pub use world::{World, WorldConfig, WorldState};

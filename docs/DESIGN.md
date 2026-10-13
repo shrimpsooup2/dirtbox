@@ -5,10 +5,9 @@ size, atmosphere, terrain and disasters. Life starts as simple bacteria, gets a
 kit of physical building blocks and a neural brain, pays real energy and matter
 costs for everything it does, and evolves to fit the world you made.
 
-> Status: **design v0.2**. The open decisions from v0.1 are settled (see §16).
-> Phase 0 headless core is done: core, grid, sim scheduler, hardware
-> calibration and CLI. The 3D globe viewer is next. It needs crates.io access
-> for its graphics dependencies.
+> Status: **design v0.3**. Phase 0 (foundations) is done: the headless core
+> (core, grid, sim scheduler, hardware calibration, CLI) and the 3D globe
+> viewer. Phase 1 (planet and climate) is next.
 
 ---
 
@@ -469,6 +468,17 @@ whose effects come out of the same physics as everything else. There is no
 - Any planet parameter, while the sim is running.
 - Terraform brush, climate overrides.
 - Place or remove organisms, design organisms, and selective pressures.
+- **Evolution speed** *(settings built in Phase 0; they take effect once life
+  exists)*. Every lineage evolves its own mutation rate through its DNA repair
+  genes. The player can multiply that rate:
+  - **Mutation rate** (0–100×) scales point mutations: small changes to existing
+    genes. 0 freezes evolution.
+  - **Structural** (0–100×) scales new, lost or duplicated parts, neurons,
+    synapses and metabolic modules, the main source of new complexity.
+  - **Environmental** boost (default) acts like a mutagenic environment, before
+    DNA repair. Lineages can evolve more repair to resist it, paying the energy
+    cost, as in nature.
+  - **Fixed** boost applies after repair, so it can't be evolved away.
 
 ### 11.3 Disasters
 These run through the same systems as everything else: asteroid impacts,
@@ -492,7 +502,13 @@ Pause, step, a speed slider, "run until milestone" (§6.4), fast-forward.
 
 ### 12.1 Stack
 - **Rust** simulation core with zero rendering dependencies, multithreaded.
-- **Viewer:** Bevy or wgpu + egui, 3D globe, reading snapshots of sim state.
+- **Viewer:** eframe/egui for the UI. The globe is drawn with OpenGL 3.3
+  (glow) through an egui paint callback.
+  - OpenGL runs on Windows, Linux and macOS, and it can be tested headless with
+    Mesa's software renderer.
+  - A later move to wgpu would touch only the viewer crate. GPU compute for the
+    simulation (Phase 10) would be a separate headless wgpu device in the sim
+    crates.
 - Config and presets in TOML or RON. Saves are versioned binary.
 
 ### 12.2 Workspace layout
@@ -510,7 +526,7 @@ crates/
   organism/    genome, development, parts, body physics, metabolism, producer cohorts
   brain/       CTRNN, plasticity, cost accounting
   evolution/   reproduction, recombination, mutation, speciation, phylogeny
-  viewer/      3D globe, UI
+  viewer/      3D globe (OpenGL), overlays, time controls, settings, calibration UI  [Phase 0 ✓]
 ```
 
 ### 12.3 Time model (decided)
@@ -676,3 +692,5 @@ negative pools), headless scenario tests, and benchmarks.
 | 5 | Construction | Yes, through generic physical actions and material physics only (§9) |
 | 6 | Microbes as fields | Yes (strain fields), with an optional microscope mode |
 | 7 | Time model | §12.3: real physiology on the sim clock, a season-speed knob for the planet, adaptive block time-stepping |
+| 8 | Player control of evolution speed | Mutation and structural multipliers (0–100×), with environmental or fixed boost (§11.2) |
+| 9 | Viewer tech | eframe/egui + OpenGL 3.3 (§12.1) |

@@ -19,8 +19,9 @@ Phase 0 (foundations), headless core:
 | `crates/sim` | World state, discrete-event multi-rate scheduler, state hashing for replay checks |
 | `crates/hw` | Hardware detection, calibration benchmark, population-budget recommendation |
 | `crates/cli` | The `dirtbox` command-line tool |
+| `crates/viewer` | The 3D globe viewer: overlays, time and season-speed controls, grid resolution, evolution-speed settings, cell inspector, hardware calibration |
 
-Next: the 3D globe viewer, then Phase 1 (planet and climate).
+Next: Phase 1 (planet and climate).
 
 ## Build and run
 
@@ -32,4 +33,16 @@ cargo run --release -- calibrate                   # benchmark this machine, get
 cargo run --release -- calibrate --population 50000
 cargo run --release -- grid --cells 160000         # geodesic grid statistics
 cargo run --release -- hwinfo
+cargo run --release -p dirtbox-viewer               # the 3D globe
 ```
+
+### Viewer controls
+
+- Drag to rotate, scroll or pinch to zoom, click a cell to select it.
+- Space pauses and resumes. The speed buttons set sim seconds per real second.
+- On first launch the Performance window opens. Run calibration and pick a
+  population budget. The choice is remembered.
+
+The viewer needs OpenGL 3.3. On Linux it also needs the standard desktop
+libraries `libxkbcommon-x11` and `libGL`, which almost every desktop install
+already has.
