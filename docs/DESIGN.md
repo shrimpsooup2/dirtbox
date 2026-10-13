@@ -165,6 +165,10 @@ spawned stochastically where heat and moisture allow.
 Light reaching each vertical layer follows `I(z) = I₀ · exp(−k · LAI_above(z))`.
 Water absorbs light with depth, which gives an ocean photic zone.
 
+### 4.7 Fire
+Lightning or lava ignites dry fuel. Fire needs O₂, so a planet without oxygen
+cannot burn.
+
 ### 4.8 As built in Phase 1
 
 - **Energy balance:** one temperature per cell (surface plus boundary layer).
@@ -199,10 +203,6 @@ Water absorbs light with depth, which gives an ocean photic zone.
   - Air temperature shifts by the lapse rate with height (new mountains are
     cold, without inventing heat).
   - Rivers re-route, and climate zones re-diagnose at once.
-
-### 4.7 Fire
-Lightning or lava ignites dry fuel. Fire needs O₂, so a planet without oxygen
-cannot burn.
 
 ---
 
