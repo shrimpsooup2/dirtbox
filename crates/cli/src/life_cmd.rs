@@ -119,11 +119,11 @@ pub fn run(cfg: LifeRun) -> Result<(), String> {
             );
         }
         printed_events = life.events().len();
-        if let Some(m) = cfg.until {
-            if life.has_reached(m) {
-                println!("Reached “{}”.", m.label());
-                break;
-            }
+        if let Some(m) = cfg.until
+            && life.has_reached(m)
+        {
+            println!("Reached “{}”.", m.label());
+            break;
         }
         if !life.is_alive() && life.has_reached(Milestone::LifeBegins) {
             println!("Life died out.");

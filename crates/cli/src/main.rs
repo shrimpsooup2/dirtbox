@@ -46,7 +46,7 @@ COMMANDS:
                    --stride <d>         climate steps every d days (default 5)
                    --mutation <x>       point-mutation multiplier (default 1)
                    --structural <x>     structural-mutation multiplier (default 1)
-                   --until <milestone>  stop at a milestone, e.g. oxygenic, oxygen, predators
+                   --until <milestone>  stop at a milestone, e.g. oxygenic, 'oxygen in', phago
                    --report-years <y>   print a line every y planet years (default 5)
     help         Show this message
 ";
@@ -348,7 +348,7 @@ fn group(v: u64) -> String {
     let s = v.to_string();
     let mut out = String::new();
     for (i, ch) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(ch);

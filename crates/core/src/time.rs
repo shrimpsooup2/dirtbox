@@ -79,7 +79,7 @@ impl StepLevel {
 
     /// Whether an organism on this level takes a step at time `t`.
     pub fn is_boundary(self, t: SimTime) -> bool {
-        t.0 % self.quanta() == 0
+        t.0.is_multiple_of(self.quanta())
     }
 }
 

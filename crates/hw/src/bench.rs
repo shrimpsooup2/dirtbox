@@ -373,7 +373,7 @@ mod tests {
             seed: 1,
         });
         assert_eq!(r.agents, 500);
-        assert!(r.agent_steps > 0 && r.agent_steps % 500 == 0);
+        assert!(r.agent_steps > 0 && r.agent_steps.is_multiple_of(500));
         assert!(r.steps_per_second() > 0.0);
     }
 

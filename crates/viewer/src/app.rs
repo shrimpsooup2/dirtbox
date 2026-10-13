@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Color32, RichText, Sense};
 use egui_glow::glow::{self, HasContext};
 
+use dirtbox_chemistry::{Milestone, Module};
 use dirtbox_climate::{GlobalSummary, StepMode};
 use dirtbox_core::time::QUANTUM_SECONDS;
 use dirtbox_core::{SimTime, Vec3};
@@ -18,20 +19,28 @@ use dirtbox_sim::{EvolutionSettings, MutationBoost, World};
 use crate::calibration::Calibration;
 use crate::camera::{Mat4, OrbitCamera, V3};
 use crate::globe::{FrameUniforms, GlobeMesh, GlobeRenderer};
-use crate::overlay::{self, Legend, Overlay, Scale, ZoneGroup};
+use crate::overlay::{self, Legend, Lifestyle, Overlay, Scale};
 use crate::worldgen::{PendingWorld, WorldRecipe};
 
 /// Grid subdivisions offered for new worlds (cell counts 2,562 to 163,842).
 const GRID_CHOICES: [u32; 5] = [16, 32, 48, 64, 128];
 /// Sim seconds per wall second.
-const SPEEDS: [(f64, &str); 6] = [
+const SPEEDS: [(f64, &str); 7] = [
     (1.0, "1×"),
     (10.0, "10×"),
     (100.0, "100×"),
     (1_000.0, "1k×"),
     (10_000.0, "10k×"),
     (100_000.0, "100k×"),
+    (1_000_000.0, "1M×"),
 ];
+/// Planet days per wall second above which the climate is sampled rather
+/// than run every day (see `World::set_climate_stride`).
+const STRIDE_THRESHOLD_DAYS: f64 = 30.0;
+/// Climate stride while fast-forwarding to a milestone.
+const FAST_FORWARD_STRIDE: u32 = 10;
+/// Longest fast-forward, planet years.
+const FAST_FORWARD_LIMIT: f64 = 500.0;
 /// Above this many planet seconds per wall second the climate switches to
 /// day-long steps (no day/night cycle) to keep up.
 const DAILY_MODE_THRESHOLD: f64 = 6.0 * 3600.0;
@@ -43,6 +52,7 @@ const BACKGROUND: Color32 = Color32::from_rgb(0x0e, 0x0f, 0x12);
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     View,
+    Life,
     Planet,
     Terraform,
     Settings,
@@ -65,6 +75,13 @@ struct Terraform {
     strength: f64,
     flatten_target: Option<f64>,
     sea_level: f64,
+}
+
+/// A run toward a milestone at full speed.
+struct FastForward {
+    target: Milestone,
+    /// Planet seconds when it started.
+    from: f64,
 }
 
 /// A loaded world plus everything derived from it for display.
@@ -103,6 +120,10 @@ pub struct DirtboxApp {
 
     paused: bool,
     speed: f64,
+    fast_forward: Option<FastForward>,
+    fast_forward_choice: Milestone,
+    /// A message for the player (e.g. a milestone reached), with when it appeared.
+    notice: Option<(String, Instant)>,
 
     show_new_world: bool,
     recipe: WorldRecipe,
@@ -163,6 +184,9 @@ impl DirtboxApp {
             },
             paused: false,
             speed: 100.0,
+            fast_forward: None,
+            fast_forward_choice: Milestone::Metabolism(Module::OxygenicPhotosynthesis),
+            notice: None,
             show_new_world: false,
             recipe,
             hw: detect(),
@@ -185,6 +209,7 @@ impl DirtboxApp {
         self.camera.lon = sun.longitude() as f32;
         self.hovered = None;
         self.selected = None;
+        self.fast_forward = None;
         self.terraform.sea_level = world.state().terrain.sea_level();
         self.loaded = Some(Loaded {
             summary: world
@@ -194,13 +219,7 @@ impl DirtboxApp {
             world,
             mesh,
             values: Vec::new(),
-            legend: Legend {
-                scale: Scale::None,
-                low: String::new(),
-                mid: None,
-                high: String::new(),
-                note: "",
-            },
+            legend: Legend::none(""),
             colours_dirty: true,
             positions_dirty: true,
             last_colouring: Instant::now(),
@@ -217,6 +236,50 @@ impl DirtboxApp {
             self.paused = !self.paused;
         }
         let Some(l) = &mut self.loaded else { return };
+        if let Some(ff) = &self.fast_forward {
+            // As fast as this computer allows, until the milestone.
+            l.world.set_climate_mode(StepMode::DailyMean);
+            l.world.set_climate_stride(FAST_FORWARD_STRIDE);
+            let state = l.world.state();
+            let years_done = (state.planet_seconds() - ff.from) / state.calendar().year_length;
+            let before = state.now().seconds();
+            let reached = l.world.run_until_milestone(
+                ff.target,
+                (FAST_FORWARD_LIMIT - years_done).max(0.0),
+                Some(FRAME_BUDGET),
+            );
+            let state = l.world.state();
+            let dt = ctx.input(|i| i.stable_dt).min(0.1) as f64;
+            l.achieved_speed =
+                0.9 * l.achieved_speed + 0.1 * (state.now().seconds() - before) / dt.max(1e-3);
+            l.sim_target_seconds = state.now().seconds();
+            let years_done = (state.planet_seconds() - ff.from) / state.calendar().year_length;
+            let message = if reached {
+                Some(format!(
+                    "Reached “{}” after {:.1} planet years.",
+                    ff.target.label(),
+                    years_done
+                ))
+            } else if !state.life.is_alive() && state.life.has_reached(Milestone::LifeBegins) {
+                Some("Stopped: all life has died out.".to_string())
+            } else if years_done >= FAST_FORWARD_LIMIT {
+                Some(format!(
+                    "Stopped after {FAST_FORWARD_LIMIT:.0} planet years without reaching “{}”.",
+                    ff.target.label()
+                ))
+            } else {
+                None
+            };
+            if let Some(m) = message {
+                self.notice = Some((m, Instant::now()));
+                self.fast_forward = None;
+                self.paused = true;
+                l.world.set_climate_stride(1);
+            }
+            l.colours_dirty = true;
+            ctx.request_repaint();
+            return;
+        }
         if self.paused {
             l.achieved_speed = 0.0;
             return;
@@ -228,6 +291,15 @@ impl DirtboxApp {
             StepMode::Diurnal
         };
         l.world.set_climate_mode(mode);
+        let days_per_second = self.speed * k / 86_400.0;
+        let stride = if mode == StepMode::DailyMean && days_per_second > STRIDE_THRESHOLD_DAYS {
+            (days_per_second / STRIDE_THRESHOLD_DAYS)
+                .round()
+                .clamp(1.0, 10.0) as u32
+        } else {
+            1
+        };
+        l.world.set_climate_stride(stride);
 
         let dt = ctx.input(|i| i.stable_dt).min(0.1) as f64;
         l.sim_target_seconds += dt * self.speed;
@@ -311,12 +383,30 @@ impl DirtboxApp {
                 ui.label(format!("Sim {}", sim_clock(state.now().seconds())));
                 ui.separator();
                 ui.label(planet_date(state)).on_hover_text(
-                    if state.climate_mode() == StepMode::DailyMean {
+                    if state.climate_stride() > 1 {
+                        "Fast forward: the climate is simulated one day in every few, so seasons are milder than they should be. Slow down for full detail."
+                    } else if state.climate_mode() == StepMode::DailyMean {
                         "At this speed the climate takes day-long steps (no day/night cycle)."
                     } else {
                         "The climate steps hourly, with day and night."
                     },
                 );
+                if self.fast_forward.is_some() {
+                    ui.separator();
+                    ui.label(RichText::new("Fast-forwarding…").color(ui.visuals().warn_fg_color));
+                    if ui.button("Stop").clicked() {
+                        self.fast_forward = None;
+                        self.paused = true;
+                    }
+                }
+            }
+            if let Some((text, at)) = &self.notice {
+                if at.elapsed() < Duration::from_secs(12) {
+                    ui.separator();
+                    ui.label(RichText::new(format!("★ {text}")).strong());
+                } else {
+                    self.notice = None;
+                }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Performance…").clicked() {
@@ -334,6 +424,7 @@ impl DirtboxApp {
         ui.horizontal(|ui| {
             for (tab, label) in [
                 (Tab::View, "View"),
+                (Tab::Life, "Life"),
                 (Tab::Planet, "Planet"),
                 (Tab::Terraform, "Terraform"),
                 (Tab::Settings, "Settings"),
@@ -344,6 +435,7 @@ impl DirtboxApp {
         ui.separator();
         egui::ScrollArea::vertical().show(ui, |ui| match self.tab {
             Tab::View => self.view_tab(ui),
+            Tab::Life => self.life_tab(ui),
             Tab::Planet => self.planet_tab(ui),
             Tab::Terraform => self.terraform_tab(ui),
             Tab::Settings => self.settings_tab(ui),
@@ -356,6 +448,7 @@ impl DirtboxApp {
         egui::ComboBox::from_id_salt("overlay")
             .selected_text(self.overlay.label())
             .width(220.0)
+            .height(520.0)
             .show_ui(ui, |ui| {
                 for o in Overlay::ALL {
                     ui.selectable_value(&mut self.overlay, o, o.label());
@@ -433,17 +526,252 @@ impl DirtboxApp {
                             state.terrain.ocean_fraction(&state.grid) * 100.0
                         ),
                     );
+                    let a = &state.planet().atmosphere;
                     row(
                         ui,
                         "CO₂",
-                        format!(
-                            "{} ppm",
-                            overlay::group(
-                                state.planet().atmosphere.ppm(state.planet().atmosphere.co2) as f32
-                            )
-                        ),
+                        format!("{} ppm", overlay::group(a.ppm(a.co2) as f32)),
+                    );
+                    row(
+                        ui,
+                        "Methane",
+                        format!("{} ppm", overlay::significant(a.ppm(a.ch4) as f32)),
+                    );
+                    row(
+                        ui,
+                        "Oxygen",
+                        format!("{} ppm", overlay::significant(a.ppm(a.o2) as f32)),
                     );
                 });
+        }
+    }
+
+    fn life_tab(&mut self, ui: &mut egui::Ui) {
+        let Some(l) = &mut self.loaded else {
+            ui.label("No world yet.");
+            return;
+        };
+        let started = l.world.state().life.has_reached(Milestone::LifeBegins);
+        let alive = l.world.state().life.is_alive();
+        if !alive {
+            ui.label(if started {
+                "All life has died out."
+            } else {
+                "No life yet."
+            });
+            ui.label(
+                RichText::new("Base bacteria are simple fermenters that like warm water. They start at the strongest hydrothermal vents and have to evolve everything else. Oxygen is poison to them.")
+                    .weak()
+                    .small(),
+            );
+            if ui.button("Seed base bacteria").clicked() {
+                let cells = l.world.seed_life();
+                self.notice = Some((
+                    format!("Seeded base bacteria at {} vents.", cells.len()),
+                    Instant::now(),
+                ));
+                l.colours_dirty = true;
+            }
+            if !started {
+                return;
+            }
+        }
+        let state = l.world.state();
+        let life = &state.life;
+        let st = life.stats();
+        let cal = state.calendar();
+        let year_of = |t: f64| t / cal.year_length;
+        let accel = state.time_model().geologic_acceleration;
+        let first = life.events().first().map_or(0.0, |e| e.time);
+        let gt = |mol: f64| mol * 12.0 / 1e15;
+
+        section(ui, "Biosphere");
+        egui::Grid::new("life")
+            .num_columns(2)
+            .spacing([12.0, 2.0])
+            .show(ui, |ui| {
+                row(
+                    ui,
+                    "Living carbon",
+                    format!("{} Gt C", overlay::significant(gt(st.biomass) as f32)),
+                );
+                if st.biomass > 0.0 {
+                    row(
+                        ui,
+                        "In the sea / on land",
+                        format!(
+                            "{:.0}% / {:.0}%",
+                            100.0 * st.ocean_biomass / st.biomass,
+                            100.0 * st.land_biomass / st.biomass
+                        ),
+                    );
+                }
+                row(
+                    ui,
+                    "Cells with life",
+                    format!(
+                        "{} ({:.0}%)",
+                        overlay::group(st.occupied_cells as f32),
+                        100.0 * st.occupied_cells as f64 / state.grid.cell_count() as f64
+                    ),
+                );
+                row(
+                    ui,
+                    "Strains",
+                    format!(
+                        "{} alive · {} ever",
+                        overlay::group(st.strains as f32),
+                        overlay::group(life.registry().total_ever() as f32)
+                    ),
+                );
+                row(
+                    ui,
+                    "Carbon fixed",
+                    format!(
+                        "{} Gt C/yr",
+                        overlay::significant(gt(st.productivity) as f32)
+                    ),
+                );
+                row(
+                    ui,
+                    "Food in the water",
+                    format!("{} Gt C", overlay::significant(gt(st.organics) as f32)),
+                );
+                row(
+                    ui,
+                    "Buried carbon",
+                    format!("{} Gt C", overlay::significant(gt(st.buried) as f32)),
+                );
+                let years = year_of(state.planet_seconds() - first);
+                row(
+                    ui,
+                    "Evolution so far",
+                    format!(
+                        "{:.1} planet years ≈ {} kyr",
+                        years,
+                        overlay::group((years * accel / 1e3) as f32)
+                    ),
+                );
+            });
+        ui.label(
+            RichText::new("Microbes evolve on the geologic clock, so each planet year stands for many thousands of years of evolution.")
+                .weak()
+                .small(),
+        );
+
+        ui.add_space(8.0);
+        section(ui, "Metabolisms");
+        egui::Grid::new("modules")
+            .num_columns(3)
+            .spacing([8.0, 2.0])
+            .show(ui, |ui| {
+                for m in Module::ALL {
+                    let share = if st.biomass > 0.0 {
+                        st.module_biomass[m.index()] / st.biomass
+                    } else {
+                        0.0
+                    };
+                    let established = life
+                        .events()
+                        .iter()
+                        .find(|e| e.milestone == Milestone::Metabolism(m))
+                        .map(|e| year_of(e.time));
+                    let text = RichText::new(m.label()).small();
+                    ui.label(if share > 0.0 { text } else { text.weak() });
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(70.0, 8.0), Sense::hover());
+                    ui.painter().rect_filled(rect, 1.0, Color32::from_gray(45));
+                    let mut fill = rect;
+                    fill.set_width(rect.width() * share.clamp(0.0, 1.0) as f32);
+                    let [r, g, b] = overlay::sequential(0.7);
+                    ui.painter()
+                        .rect_filled(fill, 1.0, Color32::from_rgb(r, g, b));
+                    ui.label(
+                        RichText::new(match (m, established) {
+                            (Module::Fermentation, _) if started => "from the start".to_string(),
+                            (_, Some(y)) => format!("year {y:.0}"),
+                            (_, None) if share > 0.0 => format!("{:.1}%", share * 100.0),
+                            _ => "—".to_string(),
+                        })
+                        .weak()
+                        .small(),
+                    );
+                    ui.end_row();
+                }
+            });
+        ui.label(
+            RichText::new("Bars: share of living carbon in strains that carry each pathway.")
+                .weak()
+                .small(),
+        );
+
+        ui.add_space(8.0);
+        section(ui, "Fast forward");
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("milestone")
+                .selected_text(self.fast_forward_choice.label())
+                .width(190.0)
+                .show_ui(ui, |ui| {
+                    for m in Milestone::targets() {
+                        let done = life.has_reached(m);
+                        ui.add_enabled_ui(!done, |ui| {
+                            ui.selectable_value(&mut self.fast_forward_choice, m, m.label());
+                        });
+                    }
+                });
+            let target = self.fast_forward_choice;
+            let can = alive && !life.has_reached(target) && self.fast_forward.is_none();
+            if ui.add_enabled(can, egui::Button::new("Go")).clicked() {
+                self.fast_forward = Some(FastForward {
+                    target,
+                    from: state.planet_seconds(),
+                });
+                self.paused = false;
+            }
+        });
+        ui.label(
+            RichText::new(format!(
+                "Runs as fast as this computer can (climate sampled every {FAST_FORWARD_STRIDE} days) until it happens, for up to {FAST_FORWARD_LIMIT:.0} planet years. It may never happen."
+            ))
+            .weak()
+            .small(),
+        );
+
+        ui.add_space(8.0);
+        section(ui, "Most common strains");
+        let mut top: Vec<_> = life
+            .registry()
+            .iter()
+            .filter(|(_, r)| r.biomass > 0.0)
+            .collect();
+        top.sort_by(|a, b| b.1.biomass.total_cmp(&a.1.biomass));
+        for (_, r) in top.iter().take(6) {
+            let share = r.biomass / st.biomass.max(1e-30);
+            ui.horizontal(|ui| {
+                let [cr, cg, cb] = Lifestyle::of(&r.genome).colour();
+                let (sw, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), Sense::hover());
+                ui.painter()
+                    .rect_filled(sw, 2.0, Color32::from_rgb(cr, cg, cb));
+                ui.label(RichText::new(format!("#{} {:.0}%", r.serial, share * 100.0)).small())
+                    .on_hover_text(strain_details(&r.genome, r.parent, year_of(r.born)));
+                ui.label(
+                    RichText::new(Lifestyle::of(&r.genome).label())
+                        .weak()
+                        .small(),
+                );
+            });
+        }
+
+        ui.add_space(8.0);
+        section(ui, "Events");
+        for e in life.events().iter().rev().take(30) {
+            ui.label(
+                RichText::new(format!(
+                    "Year {:.1}: {}",
+                    year_of(e.time),
+                    e.milestone.describe()
+                ))
+                .small(),
+            );
         }
     }
 
@@ -668,7 +996,7 @@ impl DirtboxApp {
             self.error = Some(e);
         }
         ui.label(
-            RichText::new("Takes effect once life exists (Phase 2).")
+            RichText::new("Microbes use these now; DNA repair, which the environmental boost can be evolved against, arrives with multicellular life.")
                 .weak()
                 .small(),
         );
@@ -944,6 +1272,10 @@ impl DirtboxApp {
                     ui.label("Climate spin-up");
                     ui.add(egui::Slider::new(&mut r.spin_up_years, 0..=20).suffix(" planet years"))
                         .on_hover_text("Simulated before the world appears, so it starts close to its natural balance.");
+                    ui.end_row();
+                    ui.label("Life");
+                    ui.checkbox(&mut r.with_life, "Start with base bacteria")
+                        .on_hover_text("Seeds simple fermenters at the strongest hydrothermal vents. You can also seed them later from the Life tab.");
                     ui.end_row();
                 });
                 ui.add_space(6.0);
@@ -1260,6 +1592,31 @@ fn cell_inspector(ui: &mut egui::Ui, l: &Loaded, overlay: Overlay, cell: CellId,
                     format!("{:.0}% strength", t.vents[i] * 100.0),
                 );
             }
+            let life = &state.life;
+            if ocean {
+                row(
+                    ui,
+                    "Organic food",
+                    format!(
+                        "{} mol C/m²",
+                        overlay::significant(
+                            life.pool(cell, dirtbox_chemistry::pool::ORGANICS) as f32
+                        )
+                    ),
+                );
+                row(
+                    ui,
+                    "Dissolved O₂",
+                    format!(
+                        "{}% of saturation",
+                        overlay::significant(
+                            (100.0 * life.pool(cell, dirtbox_chemistry::pool::O2)
+                                / (0.25 * life.params.mixed_layer))
+                                as f32
+                        )
+                    ),
+                );
+            }
             if let Some(text) = l.values.get(i).and_then(|&v| overlay::describe(overlay, v))
                 && !matches!(
                     overlay,
@@ -1273,6 +1630,66 @@ fn cell_inspector(ui: &mut egui::Ui, l: &Loaded, overlay: Overlay, cell: CellId,
                 row(ui, overlay.label(), text);
             }
         });
+    let life = &state.life;
+    let strains = life.strains_in(cell);
+    if !strains.is_empty() {
+        let total: f64 = strains.iter().map(|s| s.1).sum();
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(format!(
+                "Life: {} g C/m² in {} strain{}",
+                overlay::significant((total * 12.0) as f32),
+                strains.len(),
+                if strains.len() == 1 { "" } else { "s" }
+            ))
+            .strong(),
+        );
+        let cal = state.calendar();
+        for (id, b) in strains {
+            let Some(r) = life.strain(id) else { continue };
+            ui.horizontal(|ui| {
+                let [cr, cg, cb] = Lifestyle::of(&r.genome).colour();
+                let (sw, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), Sense::hover());
+                ui.painter()
+                    .rect_filled(sw, 2.0, Color32::from_rgb(cr, cg, cb));
+                ui.label(RichText::new(format!("#{} {:.0}%", r.serial, 100.0 * b / total)).small())
+                    .on_hover_text(strain_details(
+                        &r.genome,
+                        r.parent,
+                        r.born / cal.year_length,
+                    ));
+                ui.label(
+                    RichText::new(Lifestyle::of(&r.genome).label())
+                        .weak()
+                        .small(),
+                );
+            });
+        }
+    }
+}
+
+/// Hover text describing a strain's genome.
+fn strain_details(g: &dirtbox_chemistry::Genome, parent: Option<u64>, born_year: f64) -> String {
+    let modules: Vec<String> = Module::ALL
+        .iter()
+        .filter(|&&m| g.has(m))
+        .map(|&m| format!("{} {:.0}%", m.label(), g.efficiency(m) * 100.0))
+        .collect();
+    format!(
+        "{}\nBest at {:.0} °C (±{:.0}) · O₂ tolerance {:.0}%\nSize {:.1} µm · motility {:.0}% · spores {:.0}% · sticky {:.0}% · toxins {:.0}%{}\nArose in year {:.1}{}",
+        modules.join(", "),
+        g.temp_optimum - 273.15,
+        g.temp_tolerance,
+        g.oxygen_tolerance * 100.0,
+        g.size,
+        g.motility * 100.0,
+        g.dormancy * 100.0,
+        g.adhesion * 100.0,
+        g.toxin * 100.0,
+        if g.complex { " · complex cell" } else { "" },
+        born_year,
+        parent.map_or(String::new(), |p| format!(" from #{p}")),
+    )
 }
 
 fn draw_wind_arrows(
@@ -1376,13 +1793,12 @@ fn legend_widget(ui: &mut egui::Ui, legend: &Legend) {
             });
         }
         Scale::Categorical => {
-            for g in ZoneGroup::ALL {
+            for &(label, [cr, cg, cb]) in &legend.categories {
                 ui.horizontal(|ui| {
                     let (r, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), Sense::hover());
-                    let [cr, cg, cb] = g.colour();
                     ui.painter()
                         .rect_filled(r, 2.0, Color32::from_rgb(cr, cg, cb));
-                    ui.label(RichText::new(g.label()).small());
+                    ui.label(RichText::new(label).small());
                 });
             }
         }

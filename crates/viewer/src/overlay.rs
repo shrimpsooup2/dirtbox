@@ -10,6 +10,7 @@
 //! The "Satellite" view isn't a data encoding: it approximates what the
 //! planet looks like from orbit (bare ground, water, ice and clouds).
 
+use dirtbox_chemistry::{Genome, Module, pool};
 use dirtbox_climate::ClimateZone;
 use dirtbox_core::Vec3;
 use dirtbox_grid::GeodesicGrid;
@@ -129,6 +130,81 @@ pub enum Overlay {
     Latitude,
     CellArea,
     Plain,
+    Biomass,
+    Metabolism,
+    Diversity,
+    Oxygen,
+    Organics,
+    Nutrients,
+}
+
+/// What a strain mainly lives on, for the metabolism map.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lifestyle {
+    Fermenter,
+    Methanogen,
+    Chemosynthesiser,
+    AnoxygenicPhototroph,
+    OxygenicPhototroph,
+    AerobicHeterotroph,
+    Predator,
+}
+
+impl Lifestyle {
+    pub const ALL: [Lifestyle; 7] = [
+        Lifestyle::Fermenter,
+        Lifestyle::Methanogen,
+        Lifestyle::Chemosynthesiser,
+        Lifestyle::AnoxygenicPhototroph,
+        Lifestyle::OxygenicPhototroph,
+        Lifestyle::AerobicHeterotroph,
+        Lifestyle::Predator,
+    ];
+
+    /// The module a genome runs best (nitrogen fixation aside).
+    pub fn of(g: &Genome) -> Lifestyle {
+        let main = Module::ALL
+            .iter()
+            .filter(|&&m| m != Module::NitrogenFixation)
+            .max_by(|&&a, &&b| g.efficiency(a).total_cmp(&g.efficiency(b)))
+            .copied()
+            .unwrap_or(Module::Fermentation);
+        match main {
+            Module::Fermentation | Module::NitrogenFixation => Lifestyle::Fermenter,
+            Module::Methanogenesis => Lifestyle::Methanogen,
+            Module::Chemosynthesis => Lifestyle::Chemosynthesiser,
+            Module::AnoxygenicPhotosynthesis => Lifestyle::AnoxygenicPhototroph,
+            Module::OxygenicPhotosynthesis => Lifestyle::OxygenicPhototroph,
+            Module::AerobicRespiration => Lifestyle::AerobicHeterotroph,
+            Module::Phagocytosis => Lifestyle::Predator,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Lifestyle::Fermenter => "Fermenters",
+            Lifestyle::Methanogen => "Methanogens",
+            Lifestyle::Chemosynthesiser => "Chemosynthesisers",
+            Lifestyle::AnoxygenicPhototroph => "Purple phototrophs (no O₂)",
+            Lifestyle::OxygenicPhototroph => "Oxygenic phototrophs",
+            Lifestyle::AerobicHeterotroph => "Aerobic decomposers",
+            Lifestyle::Predator => "Predators",
+        }
+    }
+
+    /// Categorical hues: green for the oxygen makers, violet for the
+    /// purple bacteria, amber for the fermenters.
+    pub fn colour(self) -> Rgb {
+        hex(match self {
+            Lifestyle::Fermenter => 0xc98500,
+            Lifestyle::Methanogen => 0xd55181,
+            Lifestyle::Chemosynthesiser => 0x3987e5,
+            Lifestyle::AnoxygenicPhototroph => 0x9085e9,
+            Lifestyle::OxygenicPhototroph => 0x199e70,
+            Lifestyle::AerobicHeterotroph => 0xe66767,
+            Lifestyle::Predator => 0xe6eaee,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,16 +221,19 @@ pub struct Legend {
     pub mid: Option<String>,
     pub high: String,
     pub note: &'static str,
+    /// Names and colours, for categorical maps.
+    pub categories: Vec<(&'static str, Rgb)>,
 }
 
 impl Legend {
-    fn none(note: &'static str) -> Self {
+    pub fn none(note: &'static str) -> Self {
         Legend {
             scale: Scale::None,
             low: String::new(),
             mid: None,
             high: String::new(),
             note,
+            categories: Vec::new(),
         }
     }
 
@@ -165,12 +244,24 @@ impl Legend {
             mid: None,
             high: high.into(),
             note,
+            categories: Vec::new(),
+        }
+    }
+
+    fn categorical(categories: Vec<(&'static str, Rgb)>, note: &'static str) -> Self {
+        Legend {
+            scale: Scale::Categorical,
+            low: String::new(),
+            mid: None,
+            high: String::new(),
+            note,
+            categories,
         }
     }
 }
 
 impl Overlay {
-    pub const ALL: [Overlay; 14] = [
+    pub const ALL: [Overlay; 20] = [
         Overlay::Satellite,
         Overlay::Elevation,
         Overlay::Temperature,
@@ -183,6 +274,12 @@ impl Overlay {
         Overlay::ClimateZones,
         Overlay::Sunlight,
         Overlay::Latitude,
+        Overlay::Biomass,
+        Overlay::Metabolism,
+        Overlay::Diversity,
+        Overlay::Oxygen,
+        Overlay::Organics,
+        Overlay::Nutrients,
         Overlay::CellArea,
         Overlay::Plain,
     ];
@@ -203,6 +300,12 @@ impl Overlay {
             Overlay::Latitude => "Latitude",
             Overlay::CellArea => "Cell area",
             Overlay::Plain => "Plain",
+            Overlay::Biomass => "Life: biomass",
+            Overlay::Metabolism => "Life: main metabolism",
+            Overlay::Diversity => "Life: diversity",
+            Overlay::Oxygen => "Water: dissolved oxygen",
+            Overlay::Organics => "Water: organic food",
+            Overlay::Nutrients => "Water: nutrients",
         }
     }
 
@@ -220,6 +323,9 @@ impl Overlay {
         let c = &state.climate;
         let t = &state.terrain;
         let year = c.stats.last_year.as_ref();
+        let life = &state.life;
+        let air_oxygen = state.planet().atmosphere.o2 / 0.21;
+        let saturated = 0.25 * life.params.mixed_layer;
         grid.cells()
             .map(|cell| {
                 let i = cell as usize;
@@ -244,6 +350,29 @@ impl Overlay {
                     Overlay::Sunlight => c.insolation[i],
                     Overlay::Latitude => grid.latitude(cell).to_degrees(),
                     Overlay::CellArea => grid.area(cell) * radius_km * radius_km,
+                    // g C per m².
+                    Overlay::Biomass => life.biomass(cell) * 12.0,
+                    Overlay::Metabolism => life.dominant(cell).map_or(-1.0, |id| {
+                        let g = &life.registry().get(id).unwrap().genome;
+                        Lifestyle::ALL
+                            .iter()
+                            .position(|&l| l == Lifestyle::of(g))
+                            .unwrap() as f64
+                    }),
+                    Overlay::Diversity => life.diversity(cell),
+                    // Percent of saturation with today's air.
+                    Overlay::Oxygen => {
+                        100.0
+                            * if t.is_ocean(cell) {
+                                life.pool(cell, pool::O2) / saturated
+                            } else {
+                                air_oxygen
+                            }
+                    }
+                    Overlay::Organics => life.pool(cell, pool::ORGANICS),
+                    // The scarcer of N and P, as P-equivalents (N/16).
+                    Overlay::Nutrients => (life.pool(cell, pool::NITROGEN) / 16.0)
+                        .min(life.pool(cell, pool::PHOSPHORUS)),
                 }) as f32
             })
             .collect()
@@ -257,9 +386,11 @@ impl Overlay {
         match self {
             Overlay::Satellite => (
                 (0..n).map(|i| satellite(state, i)).collect(),
-                Legend::none(
-                    "How the planet would look from orbit. No life yet, so the land is bare rock, sand and soil.",
-                ),
+                Legend::none(if state.life.is_alive() {
+                    "How the planet would look from orbit. Dense microbial life tints the water green and darkens the land."
+                } else {
+                    "How the planet would look from orbit. No life yet, so the land is bare rock, sand and soil."
+                }),
             ),
             Overlay::Plain => (vec![hex(PLAIN); n], Legend::none("The bare grid.")),
             Overlay::Elevation => {
@@ -276,6 +407,7 @@ impl Overlay {
                         mid: Some("sea level".into()),
                         high: format!("{} m high", group(max_land)),
                         note: "Below sea level in blue, land in red.",
+                        categories: Vec::new(),
                     },
                 )
             }
@@ -287,6 +419,7 @@ impl Overlay {
                     mid: Some("0 °C".into()),
                     high: "+40 °C".into(),
                     note: "",
+                    categories: Vec::new(),
                 },
             ),
             Overlay::Precipitation => (
@@ -372,15 +505,98 @@ impl Overlay {
                             other => ZoneGroup::of(other).map_or(hex(PLAIN), ZoneGroup::colour),
                         })
                         .collect(),
-                    Legend {
-                        scale: Scale::Categorical,
-                        low: String::new(),
-                        mid: None,
-                        high: String::new(),
-                        note: "Köppen groups, diagnosed from the last simulated year. Hover a cell for its exact zone.",
-                    },
+                    Legend::categorical(
+                        ZoneGroup::ALL
+                            .iter()
+                            .map(|g| (g.label(), g.colour()))
+                            .collect(),
+                        "Köppen groups, diagnosed from the last simulated year. Hover a cell for its exact zone.",
+                    ),
                 ),
             },
+            Overlay::Biomass => (
+                (0..n)
+                    .map(|i| {
+                        if values[i] <= 0.0 {
+                            empty(ocean[i])
+                        } else {
+                            sequential(log_scale(values[i], 1e-4, 10.0).max(0.04))
+                        }
+                    })
+                    .collect(),
+                Legend::sequential(
+                    "0.0001 g C/m²",
+                    "10 g C/m²",
+                    "Living microbes, logarithmic. Uncoloured cells are lifeless.",
+                ),
+            ),
+            Overlay::Metabolism => (
+                (0..n)
+                    .map(|i| {
+                        if values[i] < 0.0 {
+                            empty(ocean[i])
+                        } else {
+                            Lifestyle::ALL[values[i] as usize].colour()
+                        }
+                    })
+                    .collect(),
+                Legend::categorical(
+                    Lifestyle::ALL
+                        .iter()
+                        .map(|l| (l.label(), l.colour()))
+                        .collect(),
+                    "How the most abundant strain in each cell makes its living.",
+                ),
+            ),
+            Overlay::Diversity => (
+                (0..n)
+                    .map(|i| {
+                        if values[i] <= 0.0 {
+                            empty(ocean[i])
+                        } else {
+                            sequential((values[i] - 1.0) / 5.0)
+                        }
+                    })
+                    .collect(),
+                Legend::sequential(
+                    "1 strain",
+                    "6+ strains",
+                    "Effective number of strains (Shannon diversity).",
+                ),
+            ),
+            Overlay::Oxygen => (
+                values
+                    .iter()
+                    .map(|&v| sequential(log_scale(v, 0.001, 100.0)))
+                    .collect(),
+                Legend::sequential(
+                    "0.001%",
+                    "100%",
+                    "Dissolved O₂ as a share of water saturated with today's air (land: the air). Logarithmic.",
+                ),
+            ),
+            Overlay::Organics => (
+                values
+                    .iter()
+                    .map(|&v| sequential(log_scale(v, 1e-4, 10.0)))
+                    .collect(),
+                Legend::sequential(
+                    "0.0001 mol C/m²",
+                    "10 mol C/m²",
+                    "Dissolved and dead organic matter: food for fermenters and decomposers. Logarithmic.",
+                ),
+            ),
+            Overlay::Nutrients => (
+                values
+                    .iter()
+                    .map(|&v| sequential(log_scale(v, 1e-5, 0.3)))
+                    .collect(),
+                Legend::sequential(
+                    "0.00001 mol/m²",
+                    "0.3 mol/m²",
+                    "Whichever of nitrogen and phosphorus is scarcer for growth (as phosphate-equivalents). Logarithmic.",
+                ),
+            ),
             Overlay::Sunlight => (
                 values.iter().map(|&v| sequential(v / 550.0)).collect(),
                 Legend::sequential(
@@ -397,6 +613,7 @@ impl Overlay {
                     mid: Some("Equator".into()),
                     high: "90° N".into(),
                     note: "",
+                    categories: Vec::new(),
                 },
             ),
             Overlay::CellArea => {
@@ -438,17 +655,25 @@ fn log_scale(v: f32, lo: f32, hi: f32) -> f32 {
     (v / lo).ln() / (hi / lo).ln()
 }
 
-/// Approximate true colour of a lifeless surface, with clouds on top.
+/// Cells without life on the life maps: dark water, grey land.
+fn empty(ocean: bool) -> Rgb {
+    hex(if ocean { ZONE_OCEAN } else { PLAIN })
+}
+
+/// Approximate true colour of the surface, with clouds on top. Dense
+/// microbial life greens the water and darkens the land.
 fn satellite(state: &WorldState, i: usize) -> Rgb {
     let c = &state.climate;
     let t = &state.terrain;
     let cell = i as u32;
+    let life = log_scale(state.life.biomass(cell) as f32, 0.02, 2.0);
     let surface = if t.is_ocean(cell) {
         if c.is_ice_covered(cell) {
             hex(0xdde4ea)
         } else {
             let depth = (-t.height_above_sea(cell) / 5000.0).clamp(0.0, 1.0) as f32;
-            lerp(hex(0x2f6d8f), hex(0x0b2340), depth.sqrt())
+            let water = lerp(hex(0x2f6d8f), hex(0x0b2340), depth.sqrt());
+            lerp(water, hex(0x2e7d5b), life * 0.7)
         }
     } else if c.lake[i] {
         hex(0x2f6d8f)
@@ -457,6 +682,7 @@ fn satellite(state: &WorldState, i: usize) -> Rgb {
         let height = (t.height_above_sea(cell) / 5000.0).clamp(0.0, 1.0) as f32;
         let ground = lerp(hex(0xc8aa78), hex(0x6e5b48), wet);
         let ground = lerp(ground, hex(0x8c8782), height);
+        let ground = lerp(ground, hex(0x4a4a33), life * 0.6);
         let snow = (c.snow[i] / 60.0).clamp(0.0, 1.0) as f32;
         let ground = lerp(ground, hex(0xf2f4f6), snow);
         // Big rivers show as blue threads.
@@ -479,9 +705,18 @@ pub fn describe(overlay: Overlay, value: f32) -> Option<String> {
         return None;
     }
     Some(match overlay {
-        Overlay::Satellite | Overlay::Plain | Overlay::ClimateZones | Overlay::CellArea => {
+        Overlay::Satellite
+        | Overlay::Plain
+        | Overlay::ClimateZones
+        | Overlay::CellArea
+        | Overlay::Metabolism => {
             return None;
         }
+        Overlay::Biomass => format!("{} g C/m²", significant(value)),
+        Overlay::Diversity => format!("{value:.1} strains (effective)"),
+        Overlay::Oxygen => format!("{}% of saturation", significant(value)),
+        Overlay::Organics => format!("{} mol C/m²", significant(value)),
+        Overlay::Nutrients => format!("{} mol/m² (P-equivalent)", significant(value)),
         Overlay::Elevation if value < 0.0 => format!("{} m below sea level", group(-value)),
         Overlay::Elevation => format!("{} m above sea level", group(value)),
         Overlay::Temperature => format!("{value:.1} °C"),
@@ -498,6 +733,22 @@ pub fn describe(overlay: Overlay, value: f32) -> Option<String> {
             if value >= 0.0 { "N" } else { "S" }
         ),
     })
+}
+
+/// Three significant figures, readable at any magnitude.
+pub fn significant(v: f32) -> String {
+    if v == 0.0 {
+        "0".into()
+    } else if v.abs() >= 1000.0 {
+        group(v)
+    } else if v.abs() >= 0.01 {
+        format!("{v:.3}")
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string()
+    } else {
+        format!("{v:.2e}")
+    }
 }
 
 /// 12345.6 → "12,346".

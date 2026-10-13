@@ -524,8 +524,8 @@ impl World {
         let started = Instant::now();
         let year_sim = self.state.calendar.year_length / self.state.time_model.season_speed;
         let end = SimTime::from_seconds_ceil(self.state.now.seconds() + max_years * year_sim);
-        // Small chunks so the check happens often.
-        let chunk = LIFE_STEP / self.state.time_model.season_speed * 10.0;
+        // A day at a time, so the check (and the budget) is honoured often.
+        let chunk = LIFE_STEP / self.state.time_model.season_speed;
         while !self.state.life.has_reached(milestone) && self.state.now < end {
             if budget.is_some_and(|b| started.elapsed() >= b) {
                 break;

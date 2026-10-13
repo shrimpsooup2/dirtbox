@@ -5,8 +5,9 @@ size, atmosphere, terrain and disasters. Life starts as simple bacteria, gets a
 kit of physical building blocks and a neural brain, pays real energy and matter
 costs for everything it does, and evolves to fit the world you made.
 
-> Status: **design v0.4**. Phases 0 (foundations) and 1 (planet and climate,
-> plus terraforming) are done. Phase 2 (chemistry and the microbial era) is next.
+> Status: **design v0.5**. Phases 0 (foundations), 1 (planet and climate,
+> plus terraforming) and 2 (chemistry and the microbial era) are done. Phase 3
+> (multicellularity and producers) is next.
 
 ---
 
@@ -295,6 +296,62 @@ experiments; it is not needed for the world to evolve.
   daily-mean climate).
 - **Start-later presets** that begin from a saved microbial world, for players
   who want to skip straight to multicellular life.
+
+### 6.5 As built in Phase 2
+
+- **Pools per cell** (mol m⁻² of the 50 m mixed layer, or of soil on land):
+  organics, H₂, reductants (Fe²⁺/H₂S, counted as the O₂ they would consume),
+  dissolved O₂, fixed N and phosphate. CO₂, CH₄, O₂ and N₂ are the planet's
+  atmosphere, converted between moles and bar with one mean molar mass so
+  that moles are conserved exactly.
+- **Strain fields:** 8 slots per cell holding (strain, biomass); every strain
+  lives once in a registry with its genome, serial number, parent and birth
+  time. When more strains arrive than fit, residents merge into their nearest
+  relative and small newcomers die on arrival.
+- **Metabolism:** each module is a reaction with a growth yield set by its
+  energy (fermentation 0.1 mol C per mol organics, aerobic respiration 0.5,
+  methanogenesis 0.015 per H₂, chemosynthesis 0.05–0.25 depending on O₂).
+  Shared substrates are rationed when demand exceeds supply; phototrophs
+  shade each other (Beer–Lambert, ~10 photons per CO₂ at best); growth is
+  limited by N and P in the Redfield ratio, and N-fixers make their own N
+  (poisoned by O₂). Carrying more pathways splits the cell's enzyme budget,
+  so specialists beat generalists where one resource dominates.
+- **Death:** a base rate, maintenance respiration, cold or heat outside the
+  strain's comfort range, drought on land, O₂ poisoning (anaerobes), toxins
+  from neighbours and predation. Dormancy (spores) softens stress deaths at a
+  running cost. Dead cells become organics; their nutrients return to the
+  water, with 15% sinking to the deep ocean.
+- **Vents** add a hot gradient (up to 360 K) over half of a strong vent cell;
+  base bacteria (fermenters, optimum 47 °C) live there and adapt outward.
+- **Abiotic chemistry:** UV and lightning organics (shut off by an ozone
+  layer once O₂ rises), vent H₂, reductants and nutrients, iron welling up
+  from an anoxic deep ocean, weathering phosphate, lightning nitrogen;
+  reductants burn O₂ within days; organics oxidise, decay and are buried; the
+  deep ocean trades nutrients with the surface over a 300-year overturn; the
+  sea surface trades O₂ with the air; CH₄ lives ~12 years in today's air and
+  up to 5,000 without O₂; reducing volcanic gases consume O₂.
+- **Dispersal:** ocean mixing (5×10⁴ m² s⁻¹) and slower spread over wet land,
+  faster for motile strains, slower for sticky ones; dissolved pools mix in
+  the ocean; rivers carry land nutrients and organics to the coast.
+- **Evolution:** each strain-cell spawns point mutants (2×10⁻³ per geologic
+  year) and structural mutants (5×10⁻⁵) scaled by the player's multipliers
+  and by population size; phagocytes occasionally keep a module from their
+  prey (endosymbiosis). Oxygenic photosynthesis can only arise in a strain
+  that already has anoxygenic photosynthesis; engulfing needs a big cell.
+- **Milestones:** a pathway counts as established once strains running it
+  well (≥ 20% efficiency) hold ≥ 10⁹ mol C and 0.5% of all life; plus oxygen
+  at 0.1% and 10% of today's level, complex cells, land colonised (10¹³ mol C)
+  and extinction.
+- **A typical Early Earth run** (2,562 cells, default rates): base bacteria
+  spread from the vents within a few years, anoxygenic photosynthesis takes
+  over the sunlit ocean around year 15, oxygenic photosynthesis follows
+  around year 20, then aerobic respiration, nitrogen fixation, crusts on land
+  and oxygen in the air in the 40s. None of it is scripted; other planets
+  (and other seeds) take other paths, and some never oxygenate.
+- **Speed:** the life step costs ~1–3 ms per planet day on 2,562 cells and a
+  few ms on 10,242 (4 cores). Fast forward samples the climate one day in
+  ten (decision 12), giving ~0.1–0.2 planet years per second on 10,242 cells
+  in the viewer.
 
 ---
 
@@ -678,7 +735,7 @@ negative pools), headless scenario tests, and benchmarks.
 |---|---|---|
 | **0. Foundations** | Workspace, core (units, clocks, RNG), geodesic grid, scheduler, state hash, hardware calibration, headless CLI. *Then:* minimal 3D globe viewer | Deterministic replay; grid areas sum to 4πR²; calibration produces a recommendation; globe renders cells |
 | **1. Planet & climate** ✓ | Orbit, insolation, energy balance, albedo, greenhouse, wind, hydrology, ice, vents, **terraforming brushes and sea level**, planet editor | Seasons flip by hemisphere; deserts and rain shadows; snowball can be triggered (all tested, plus climate sensitivity) |
-| **2. Chemistry & microbial era** | Element pools, abiotic organics, strain fields, metabolic modules, endosymbiosis, run-until-milestone | Base bacteria spread; at least one new metabolism evolves; O₂ rises if oxygenic photosynthesis appears |
+| **2. Chemistry & microbial era** ✓ | Element pools, abiotic organics, strain fields, metabolic modules, endosymbiosis, run-until-milestone | Base bacteria spread; at least one new metabolism evolves; O₂ rises if oxygenic photosynthesis appears (all tested, plus methanogens making CH₄, exact carbon conservation and replay) |
 | **3. Multicellularity & producers** | Graduation from strains, producer cohorts, canopy light, seeds | Vegetation follows climate; taller producers evolve under shading |
 | **4. Motile bodies & metabolism** | Part catalog, development, body physics, digestion, adaptive block stepping | Energy budgets balance; starvation and growth work |
 | **5. Brains** | CTRNN, sensors, actuators, plasticity, brain costs | Agents beat random at finding food; learned avoidance of toxic food |
@@ -729,3 +786,5 @@ negative pools), headless scenario tests, and benchmarks.
 | 8 | Player control of evolution speed | Mutation and structural multipliers (0–100×), with environmental or fixed boost (§11.2) |
 | 9 | Viewer tech | eframe/egui + OpenGL 3.3 (§12.1) |
 | 10 | Terraforming | Moved forward into Phase 1: raise, lower, smooth and flatten brushes plus sea level, with the climate responding live (§4.8) |
+| 11 | Pace of the microbial era | Microbial ecology (growth, death, chemistry) runs in real planet time; microbial *mutation* runs on the geologic clock (1,000× by default). Each planet year stands for ~1,000 years of evolution, so innovations arrive in tens of planet years rather than millions (§6.5) |
+| 12 | Fast forward | Multi-day climate steps were unstable, so at high speed the climate integrates one day in every N (seasons are damped, annual means kept) while life still steps daily. The viewer says so when it is on |

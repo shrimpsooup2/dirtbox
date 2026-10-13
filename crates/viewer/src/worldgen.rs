@@ -18,15 +18,18 @@ pub struct WorldRecipe {
     pub subdivision: u32,
     /// Planet years of climate spin-up before the world appears.
     pub spin_up_years: u32,
+    /// Start with base bacteria at the vents.
+    pub with_life: bool,
 }
 
 impl Default for WorldRecipe {
     fn default() -> Self {
         Self {
-            preset: Preset::EarthModern,
+            preset: Preset::EarlyEarth,
             seed: 1,
             subdivision: 32,
             spin_up_years: 6,
+            with_life: true,
         }
     }
 }
@@ -36,6 +39,7 @@ impl WorldRecipe {
         WorldConfig {
             seed: self.seed,
             grid_subdivision: self.subdivision,
+            seed_life: self.with_life,
             ..WorldConfig::from_preset(self.preset)
         }
     }

@@ -479,6 +479,7 @@ dependencies = [
 name = "dirtbox-viewer"
 version = "0.1.0"
 dependencies = [
+ "dirtbox-chemistry",
  "dirtbox-climate",
  "dirtbox-core",
  "dirtbox-grid",
