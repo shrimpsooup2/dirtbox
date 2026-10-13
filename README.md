@@ -10,18 +10,25 @@ See [docs/DESIGN.md](docs/DESIGN.md) for the full design and roadmap.
 
 ## Status
 
-Phase 0 (foundations), headless core:
+Phases 0 (foundations) and 1 (planet and climate) are done.
 
 | Crate | What it does |
 |---|---|
 | `crates/core` | SI constants, clocks (sim / planet / geologic, with a season-speed knob), step levels, deterministic RNG streams, sphere math |
-| `crates/grid` | Geodesic hex grid (10n²+2 cells, 12 pentagons), neighbour rings, exact Voronoi cell areas, point → cell lookup |
-| `crates/sim` | World state, discrete-event multi-rate scheduler, state hashing for replay checks |
+| `crates/grid` | Geodesic hex grid (10n²+2 cells), neighbours, Voronoi areas and corners, edge geometry, point → cell lookup |
+| `crates/planet` | Star, orbit, tilt, rotation and tidal locking, size, atmosphere; seasons and sunlight; seven presets; noise terrain, vents and terraforming brushes |
+| `crates/climate` | Energy balance with a gray greenhouse, circulation-cell winds, clouds, rain and snow, sea ice, rivers and lakes, climate zones, optional carbon cycle |
+| `crates/sim` | The world (planet, terrain, climate), multi-rate scheduler, spin-up, live edits, state hashing |
 | `crates/hw` | Hardware detection, calibration benchmark, population-budget recommendation |
 | `crates/cli` | The `dirtbox` command-line tool |
-| `crates/viewer` | The 3D globe viewer: overlays, time and season-speed controls, grid resolution, evolution-speed settings, cell inspector, hardware calibration |
+| `crates/viewer` | The 3D globe: satellite view and climate overlays, planet editor, terraforming, new-world dialog, cell inspector, calibration |
 
-Next: Phase 1 (planet and climate).
+Calibrated against Earth: mean ~287 K, ~11% ice, ~64% cloud, ~2.4 mm/day of rain, and
++3.9 K for doubled CO₂. The tests check that seasons flip between hemispheres, deserts
+form in the subtropics, mountains cast rain shadows, a dimmer sun freezes the planet,
+a snowball stays frozen, and terraformed mountains turn cold.
+
+Next: Phase 2 (chemistry and the microbial era).
 
 ## Build and run
 
@@ -33,12 +40,19 @@ cargo run --release -- calibrate                   # benchmark this machine, get
 cargo run --release -- calibrate --population 50000
 cargo run --release -- grid --cells 160000         # geodesic grid statistics
 cargo run --release -- hwinfo
+cargo run --release -- climate --preset earth --years 8   # run a climate headless, print zonal means
 cargo run --release -p dirtbox-viewer               # the 3D globe
 ```
 
 ### Viewer controls
 
 - Drag to rotate, scroll or pinch to zoom, click a cell to select it.
+- **View** tab: overlays (satellite, elevation, temperature, rain, wind, clouds, snow and
+  ice, rivers, climate zones, sunlight), wind arrows, relief exaggeration.
+- **Planet** tab: edit the star, orbit, tilt, rotation, size and atmosphere live.
+- **Terraform** tab: turn the brush on, then left-drag to raise, lower, smooth or
+  flatten (right-drag rotates). The sea-level slider floods or drains the planet.
+- **New world…**: pick a preset, seed and grid size.
 - Space pauses and resumes. The speed buttons set sim seconds per real second.
 - On first launch the Performance window opens. Run calibration and pick a
   population budget. The choice is remembered.

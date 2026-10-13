@@ -5,9 +5,8 @@ size, atmosphere, terrain and disasters. Life starts as simple bacteria, gets a
 kit of physical building blocks and a neural brain, pays real energy and matter
 costs for everything it does, and evolves to fit the world you made.
 
-> Status: **design v0.3**. Phase 0 (foundations) is done: the headless core
-> (core, grid, sim scheduler, hardware calibration, CLI) and the 3D globe
-> viewer. Phase 1 (planet and climate) is next.
+> Status: **design v0.4**. Phases 0 (foundations) and 1 (planet and climate,
+> plus terraforming) are done. Phase 2 (chemistry and the microbial era) is next.
 
 ---
 
@@ -165,6 +164,41 @@ spawned stochastically where heat and moisture allow.
 ### 4.6 Light and the canopy
 Light reaching each vertical layer follows `I(z) = I₀ · exp(−k · LAI_above(z))`.
 Water absorbs light with depth, which gives an ocean photic zone.
+
+### 4.8 As built in Phase 1
+
+- **Energy balance:** one temperature per cell (surface plus boundary layer).
+  - Gray greenhouse: OLR = σT⁴/(1 + ¾τ). τ comes from CO₂, CH₄, water vapour
+    (∝ W^0.35) and clouds, all pressure-broadened.
+  - An implicit column solve, so steps of an hour or a day are both stable.
+- **Transport:**
+  - Eddy diffusion of heat and vapour, solved implicitly with preconditioned
+    conjugate gradients.
+  - Upwind advection by the wind.
+  - Latent heat and thermal breezes smoothed over fixed physical lengths, so
+    results don't depend on grid resolution.
+  - Ocean heat diffusion between ocean cells.
+- **Wind:** circulation cells whose width follows Held–Hou scaling (fast
+  spinners get more bands), centred on the thermal equator. Tidally locked
+  worlds get flow toward the point under the star.
+- **Water:** evaporation by bulk formula, rain above a humidity threshold that
+  rising air and upslope flow lower, and light background rain. Snow, sea ice
+  with conduction, soil bucket, rivers and lakes by priority-flood drainage.
+  Water is conserved exactly, including an ocean reservoir.
+- **Calibration (Earth preset, bare land):**
+  - About 287 K mean, 11% ice, 64% cloud, 0.31 albedo, 2.4 mm/day of rain.
+  - Doubled CO₂ gives +3.9 K.
+  - A runaway greenhouse begins near 1.05–1.1× today's sunlight. That matches
+    the classic estimate for the inner edge of the Sun's habitable zone.
+- **Speed (4 cores):**
+  - 10k-cell grid: ~9 ms per hourly step, ~19 ms per daily-mean step.
+  - New worlds settle on a coarse grid first, then map onto the full grid.
+  - The viewer switches to daily-mean steps at high speeds.
+- **Terraforming:**
+  - Brushes and sea level edit the terrain.
+  - Air temperature shifts by the lapse rate with height (new mountains are
+    cold, without inventing heat).
+  - Rivers re-route, and climate zones re-diagnose at once.
 
 ### 4.7 Fire
 Lightning or lava ignites dry fuel. Fire needs O₂, so a planet without oxygen
@@ -643,14 +677,14 @@ negative pools), headless scenario tests, and benchmarks.
 | Phase | Scope | Exit check |
 |---|---|---|
 | **0. Foundations** | Workspace, core (units, clocks, RNG), geodesic grid, scheduler, state hash, hardware calibration, headless CLI. *Then:* minimal 3D globe viewer | Deterministic replay; grid areas sum to 4πR²; calibration produces a recommendation; globe renders cells |
-| **1. Planet & climate** | Orbit, insolation, energy balance, albedo, greenhouse, wind, hydrology, ice, vents | Seasons flip by hemisphere; deserts and rain shadows; snowball can be triggered |
+| **1. Planet & climate** ✓ | Orbit, insolation, energy balance, albedo, greenhouse, wind, hydrology, ice, vents, **terraforming brushes and sea level**, planet editor | Seasons flip by hemisphere; deserts and rain shadows; snowball can be triggered (all tested, plus climate sensitivity) |
 | **2. Chemistry & microbial era** | Element pools, abiotic organics, strain fields, metabolic modules, endosymbiosis, run-until-milestone | Base bacteria spread; at least one new metabolism evolves; O₂ rises if oxygenic photosynthesis appears |
 | **3. Multicellularity & producers** | Graduation from strains, producer cohorts, canopy light, seeds | Vegetation follows climate; taller producers evolve under shading |
 | **4. Motile bodies & metabolism** | Part catalog, development, body physics, digestion, adaptive block stepping | Energy budgets balance; starvation and growth work |
 | **5. Brains** | CTRNN, sensors, actuators, plasticity, brain costs | Agents beat random at finding food; learned avoidance of toxic food |
 | **6. Evolution & ecology** | Reproduction, recombination, speciation, phylogeny, pathogens | Stable predator–prey over 100+ generations; a speciation event |
 | **7. Environment interaction** | Material layer, loose objects, dig/grab/place/secrete, shelter physics, dam hydrology | A dug burrow measurably damps temperature; any lineage that evolves to use it |
-| **8. God tools & disasters** | Live edits, terraforming, disasters, presets | An impact winter gives an extinction and a recovery |
+| **8. God tools & disasters** | Disasters, organism editing, selective pressures (live planet edits and terraforming arrived in Phase 1) | An impact winter gives an extinction and a recovery |
 | **9. Observation & polish** | Inspector, charts, tree, event log, save/load UX | A new player can follow one lineage through a disaster |
 | **10. Detail modes & scale** | Prebiotic chemistry, microscope mode, GPU climate, batched brains | The detailed eras run; budget targets are met |
 
@@ -694,3 +728,4 @@ negative pools), headless scenario tests, and benchmarks.
 | 7 | Time model | §12.3: real physiology on the sim clock, a season-speed knob for the planet, adaptive block time-stepping |
 | 8 | Player control of evolution speed | Mutation and structural multipliers (0–100×), with environmental or fixed boost (§11.2) |
 | 9 | Viewer tech | eframe/egui + OpenGL 3.3 (§12.1) |
+| 10 | Terraforming | Moved forward into Phase 1: raise, lower, smooth and flatten brushes plus sea level, with the climate responding live (§4.8) |
