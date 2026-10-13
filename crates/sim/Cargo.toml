@@ -8,3 +8,5 @@ rust-version.workspace = true
 [dependencies]
 dirtbox-core.workspace = true
 dirtbox-grid.workspace = true
+dirtbox-planet.workspace = true
+dirtbox-climate.workspace = true

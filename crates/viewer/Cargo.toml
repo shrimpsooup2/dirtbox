@@ -14,5 +14,7 @@ dirtbox-core.workspace = true
 dirtbox-grid.workspace = true
 dirtbox-sim.workspace = true
 dirtbox-hw.workspace = true
+dirtbox-planet.workspace = true
+dirtbox-climate.workspace = true
 eframe = { version = "0.36.2", default-features = false, features = ["glow", "default_fonts", "x11", "wayland", "persistence"] }
 egui_glow = "0.36.2"

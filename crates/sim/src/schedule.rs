@@ -60,7 +60,8 @@ pub struct StepContext {
 
 pub trait System: Send {
     fn name(&self) -> &'static str;
-    fn cadence(&self) -> Cadence;
+    /// How often to run; may depend on the world (e.g. the climate's step mode).
+    fn cadence(&self, state: &WorldState) -> Cadence;
     fn run(&mut self, state: &mut WorldState, ctx: &StepContext);
 }
 

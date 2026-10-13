@@ -5,6 +5,8 @@ mod calibration;
 mod camera;
 mod globe;
 mod overlay;
+mod planet_editor;
+mod worldgen;
 
 use eframe::egui;
 

@@ -456,17 +456,21 @@ dependencies = [
 name = "dirtbox-sim"
 version = "0.1.0"
 dependencies = [
+ "dirtbox-climate",
  "dirtbox-core",
  "dirtbox-grid",
+ "dirtbox-planet",
 ]
 
 [[package]]
 name = "dirtbox-viewer"
 version = "0.1.0"
 dependencies = [
+ "dirtbox-climate",
  "dirtbox-core",
  "dirtbox-grid",
  "dirtbox-hw",
+ "dirtbox-planet",
  "dirtbox-sim",
  "eframe",
  "egui_glow",

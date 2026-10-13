@@ -1,25 +1,28 @@
-//! The viewer application: globe, time controls, world settings and the
-//! performance (calibration) window.
+//! The viewer application: globe, time controls, planet editor, terraforming,
+//! world creation and the performance (calibration) window.
 
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText, Sense};
 use egui_glow::glow::{self, HasContext};
 
-use dirtbox_core::consts::EARTH_RADIUS;
+use dirtbox_climate::{GlobalSummary, StepMode};
 use dirtbox_core::time::QUANTUM_SECONDS;
 use dirtbox_core::{SimTime, Vec3};
 use dirtbox_grid::{CellId, GeodesicGrid};
 use dirtbox_hw::{BudgetInputs, HardwareInfo, detect, recommend, speed_for_population};
-use dirtbox_sim::{EvolutionSettings, MutationBoost, World, WorldConfig};
+use dirtbox_planet::{Brush, BrushMode, Preset};
+use dirtbox_sim::{EvolutionSettings, MutationBoost, World};
 
 use crate::calibration::Calibration;
-use crate::camera::OrbitCamera;
+use crate::camera::{Mat4, OrbitCamera, V3};
 use crate::globe::{FrameUniforms, GlobeMesh, GlobeRenderer};
-use crate::overlay::{self, Legend, Overlay, OverlayContext, Scale};
+use crate::overlay::{self, Legend, Overlay, Scale, ZoneGroup};
+use crate::worldgen::{PendingWorld, WorldRecipe};
 
-/// Grid subdivisions offered in the UI (cell counts 2,562 to 163,842).
-const GRID_CHOICES: [u32; 5] = [16, 32, 64, 96, 128];
+/// Grid subdivisions offered for new worlds (cell counts 2,562 to 163,842).
+const GRID_CHOICES: [u32; 5] = [16, 32, 48, 64, 128];
 /// Sim seconds per wall second.
 const SPEEDS: [(f64, &str); 6] = [
     (1.0, "1×"),
@@ -29,28 +32,80 @@ const SPEEDS: [(f64, &str); 6] = [
     (10_000.0, "10k×"),
     (100_000.0, "100k×"),
 ];
+/// Above this many planet seconds per wall second the climate switches to
+/// day-long steps (no day/night cycle) to keep up.
+const DAILY_MODE_THRESHOLD: f64 = 6.0 * 3600.0;
+/// Wall time the simulation may use per frame.
+const FRAME_BUDGET: Duration = Duration::from_millis(25);
 const BUDGET_KEY: &str = "population_budget";
 const BACKGROUND: Color32 = Color32::from_rgb(0x0e, 0x0f, 0x12);
 
-pub struct DirtboxApp {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    View,
+    Planet,
+    Terraform,
+    Settings,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tool {
+    Raise,
+    Lower,
+    Smooth,
+    Flatten,
+}
+
+struct Terraform {
+    active: bool,
+    tool: Tool,
+    radius_km: f64,
+    /// Metres per second of brushing (raise/lower), or blend per second
+    /// (smooth/flatten).
+    strength: f64,
+    flatten_target: Option<f64>,
+    sea_level: f64,
+}
+
+/// A loaded world plus everything derived from it for display.
+struct Loaded {
     world: World,
     mesh: GlobeMesh,
+    values: Vec<f32>,
+    legend: Legend,
+    colours_dirty: bool,
+    positions_dirty: bool,
+    last_colouring: Instant,
+    summary: GlobalSummary,
+    last_summary: Instant,
+    /// Exact (unquantised) sim time the world clock is chasing.
+    sim_target_seconds: f64,
+    /// Sim seconds per wall second actually achieved (smoothed).
+    achieved_speed: f64,
+}
+
+pub struct DirtboxApp {
+    loaded: Option<Loaded>,
+    pending: Option<PendingWorld>,
+    error: Option<String>,
     renderer: Arc<Mutex<GlobeRenderer>>,
     camera: OrbitCamera,
 
+    tab: Tab,
     overlay: Overlay,
-    values: Vec<f32>,
-    legend: Legend,
-    sun_at_last_colouring: Vec3,
     sunlit: bool,
     borders: bool,
+    relief: f64,
+    wind_arrows: bool,
     hovered: Option<CellId>,
     selected: Option<CellId>,
+    terraform: Terraform,
 
     paused: bool,
     speed: f64,
-    /// Exact (unquantised) sim time the world clock is chasing.
-    sim_target_seconds: f64,
+
+    show_new_world: bool,
+    recipe: WorldRecipe,
 
     hw: HardwareInfo,
     gl_info: String,
@@ -74,113 +129,151 @@ impl DirtboxApp {
                 gl.get_parameter_string(glow::VERSION)
             )
         };
-
-        let world = World::new(WorldConfig::default())?;
-        let mesh = GlobeMesh::build(&world.state().grid);
         let population_budget = cc
             .storage
             .and_then(|s| s.get_string(BUDGET_KEY))
             .and_then(|s| s.parse().ok());
-
-        let mut app = Self {
-            world,
-            mesh,
+        let recipe = WorldRecipe {
+            seed: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(1, |d| d.as_secs() % 100_000),
+            ..WorldRecipe::default()
+        };
+        Ok(Self {
+            loaded: None,
+            pending: Some(PendingWorld::start(recipe.clone(), cc.egui_ctx.clone())),
+            error: None,
             renderer: Arc::new(Mutex::new(renderer)),
             camera: OrbitCamera::default(),
-            overlay: Overlay::Latitude,
-            values: Vec::new(),
-            legend: Overlay::Plain.colours(&[]).1,
-            sun_at_last_colouring: Vec3::ZERO,
+            tab: Tab::View,
+            overlay: Overlay::Satellite,
             sunlit: true,
             borders: true,
+            relief: 25.0,
+            wind_arrows: false,
             hovered: None,
             selected: None,
+            terraform: Terraform {
+                active: false,
+                tool: Tool::Raise,
+                radius_km: 400.0,
+                strength: 800.0,
+                flatten_target: None,
+                sea_level: 0.0,
+            },
             paused: false,
-            speed: 10.0,
-            sim_target_seconds: 0.0,
+            speed: 100.0,
+            show_new_world: false,
+            recipe,
             hw: detect(),
             gl_info,
             calibration: Calibration::NotRun,
-            // First run: no stored budget yet, so open the performance window.
             show_performance: population_budget.is_none(),
             population_budget,
             custom_budget: population_budget.unwrap_or(20_000),
-        };
-        // Start looking at the day side.
-        app.camera.lon = app.sun().longitude() as f32;
-        app.renderer.lock().unwrap().set_mesh(&app.mesh);
-        app.recolour();
-        Ok(app)
+        })
     }
 
-    fn grid(&self) -> &GeodesicGrid {
-        &self.world.state().grid
+    fn install(&mut self, world: World) {
+        let mesh = GlobeMesh::build(&world.state().grid);
+        self.renderer.lock().unwrap().set_mesh(&mesh);
+        let sun = world
+            .state()
+            .planet()
+            .sun_state(world.state().planet_seconds())
+            .direction;
+        self.camera.lon = sun.longitude() as f32;
+        self.hovered = None;
+        self.selected = None;
+        self.terraform.sea_level = world.state().terrain.sea_level();
+        self.loaded = Some(Loaded {
+            summary: world
+                .state()
+                .climate
+                .summary(&world.state().grid, &world.state().terrain),
+            world,
+            mesh,
+            values: Vec::new(),
+            legend: Legend {
+                scale: Scale::None,
+                low: String::new(),
+                mid: None,
+                high: String::new(),
+                note: "",
+            },
+            colours_dirty: true,
+            positions_dirty: true,
+            last_colouring: Instant::now(),
+            last_summary: Instant::now(),
+            sim_target_seconds: 0.0,
+            achieved_speed: 0.0,
+        });
     }
 
-    /// Placeholder sun: overhead at the equator, circling once per planet day.
-    /// Phase 1 replaces this with the real orbit and axial tilt.
-    fn sun(&self) -> Vec3 {
-        let state = self.world.state();
-        let f = state.calendar().day_fraction(state.planet_seconds());
-        // Midnight at 0° longitude when f = 0; local noon there when f = 0.5.
-        Vec3::from_lat_lon(0.0, std::f64::consts::PI * (1.0 - 2.0 * f))
-    }
-
-    fn recolour(&mut self) {
-        let ctx = OverlayContext {
-            sun: self.sun(),
-            radius_km: EARTH_RADIUS / 1000.0,
-        };
-        self.values = self.overlay.values(self.grid(), &ctx);
-        let (colours, legend) = self.overlay.colours(&self.values);
-        self.legend = legend;
-        let expanded = self.mesh.expand_colours(&colours);
-        self.renderer.lock().unwrap().set_colours(expanded);
-        self.sun_at_last_colouring = ctx.sun;
-    }
-
-    fn rebuild_world(&mut self, subdivision: u32) {
-        let state = self.world.state();
-        let config = WorldConfig {
-            seed: state.seed(),
-            time: state.time_model().clone(),
-            calendar: state.calendar().clone(),
-            grid_subdivision: subdivision,
-            evolution: state.evolution().clone(),
-        };
-        match World::new(config) {
-            Ok(world) => {
-                self.world = world;
-                self.sim_target_seconds = 0.0;
-                self.hovered = None;
-                self.selected = None;
-                self.mesh = GlobeMesh::build(self.grid());
-                self.renderer.lock().unwrap().set_mesh(&self.mesh);
-                self.recolour();
-            }
-            Err(e) => log_error(&e),
-        }
-    }
-
+    /// Advances the world toward the speed the player asked for, within a
+    /// per-frame time budget so the UI stays responsive.
     fn advance_time(&mut self, ctx: &egui::Context) {
         if ctx.input(|i| i.key_pressed(egui::Key::Space)) && ctx.memory(|m| m.focused().is_none()) {
             self.paused = !self.paused;
         }
+        let Some(l) = &mut self.loaded else { return };
         if self.paused {
+            l.achieved_speed = 0.0;
             return;
         }
-        let dt = ctx.input(|i| i.stable_dt).min(0.1) as f64;
-        self.sim_target_seconds += dt * self.speed;
-        let quanta = (self.sim_target_seconds / QUANTUM_SECONDS).floor() as u64;
-        self.world.run_until(SimTime::from_quanta(quanta));
+        let k = l.world.state().time_model().season_speed;
+        let mode = if self.speed * k > DAILY_MODE_THRESHOLD {
+            StepMode::DailyMean
+        } else {
+            StepMode::Diurnal
+        };
+        l.world.set_climate_mode(mode);
 
-        // Re-colour time-dependent overlays once the sun has moved ~0.25°.
-        if self.overlay.is_time_dependent()
-            && self.sun().dot(self.sun_at_last_colouring) < 0.25f64.to_radians().cos()
-        {
-            self.recolour();
+        let dt = ctx.input(|i| i.stable_dt).min(0.1) as f64;
+        l.sim_target_seconds += dt * self.speed;
+        let target = SimTime::from_quanta((l.sim_target_seconds / QUANTUM_SECONDS).floor() as u64);
+        let before = l.world.state().now().seconds();
+        let (_, reached) = l.world.run_until_within(target, Some(FRAME_BUDGET));
+        if reached < target {
+            // Can't keep up: drop the backlog rather than letting it grow.
+            l.sim_target_seconds = reached.seconds();
         }
+        let speed_now = (reached.seconds() - before) / dt.max(1e-3);
+        l.achieved_speed = 0.9 * l.achieved_speed + 0.1 * speed_now;
         ctx.request_repaint();
+    }
+
+    /// Refreshes overlay colours and vertex heights when needed.
+    fn refresh_display(&mut self) {
+        let Some(l) = &mut self.loaded else { return };
+        let state = l.world.state();
+        let radius = state.planet().body.radius();
+        if l.positions_dirty {
+            let heights: Vec<f64> = state
+                .grid
+                .cells()
+                .map(|c| state.terrain.height_above_sea(c).max(0.0))
+                .collect();
+            let positions = l.mesh.positions(&state.grid, &heights, radius, self.relief);
+            self.renderer.lock().unwrap().set_positions(positions);
+            l.positions_dirty = false;
+        }
+        let live = self.overlay.is_live()
+            && !self.paused
+            && l.last_colouring.elapsed() > Duration::from_millis(300);
+        if l.colours_dirty || live {
+            l.values = self.overlay.values(state, radius / 1000.0);
+            let (colours, legend) = self.overlay.colours(state, &l.values);
+            l.legend = legend;
+            let expanded = l.mesh.expand_colours(&colours);
+            self.renderer.lock().unwrap().set_colours(expanded);
+            l.colours_dirty = false;
+            l.last_colouring = Instant::now();
+        }
+        if l.last_summary.elapsed() > Duration::from_millis(500) {
+            l.summary = state.climate.summary(&state.grid, &state.terrain);
+            l.last_summary = Instant::now();
+        }
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
@@ -197,62 +290,189 @@ impl DirtboxApp {
             for (speed, label) in SPEEDS {
                 if ui
                     .selectable_label(self.speed == speed, label)
-                    .on_hover_text(format!("{label}: {} sim seconds per real second", speed))
+                    .on_hover_text(format!("{label}: {speed} sim seconds per real second"))
                     .clicked()
                 {
                     self.speed = speed;
                 }
             }
-            ui.separator();
-            let state = self.world.state();
-            let cal = state.calendar();
-            let planet = state.planet_seconds();
-            let year = (planet / cal.year_length).floor() as u64 + 1;
-            let day_of_year = ((planet % cal.year_length) / cal.day_length).floor() as u64 + 1;
-            let local = cal.day_fraction(planet) * 24.0;
-            ui.label(format!("Sim time {}", sim_clock(state.now().seconds())));
-            ui.separator();
-            ui.label(format!(
-                "Planet: year {year}, day {day_of_year}, {:02}:{:02} at 0° longitude",
-                local.floor() as u32,
-                ((local.fract()) * 60.0).floor() as u32
-            ));
+            if let Some(l) = &self.loaded {
+                if !self.paused && l.achieved_speed < 0.8 * self.speed {
+                    ui.label(
+                        RichText::new(format!("running at {:.0}×", l.achieved_speed))
+                            .color(ui.visuals().warn_fg_color),
+                    )
+                    .on_hover_text(
+                        "This computer can't simulate this world any faster. Try a coarser grid.",
+                    );
+                }
+                ui.separator();
+                let state = l.world.state();
+                ui.label(format!("Sim {}", sim_clock(state.now().seconds())));
+                ui.separator();
+                ui.label(planet_date(state)).on_hover_text(
+                    if state.climate_mode() == StepMode::DailyMean {
+                        "At this speed the climate takes day-long steps (no day/night cycle)."
+                    } else {
+                        "The climate steps hourly, with day and night."
+                    },
+                );
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Performance…").clicked() {
                     self.show_performance = !self.show_performance;
                 }
-                if let Some(n) = self.population_budget {
-                    ui.label(
-                        RichText::new(format!("Budget {} organisms", overlay::group(n as f32)))
-                            .weak(),
-                    );
+                if ui.button("New world…").clicked() {
+                    self.show_new_world = true;
                 }
             });
         });
     }
 
-    fn world_panel(&mut self, ui: &mut egui::Ui) {
+    fn side_panel(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            for (tab, label) in [
+                (Tab::View, "View"),
+                (Tab::Planet, "Planet"),
+                (Tab::Terraform, "Terraform"),
+                (Tab::Settings, "Settings"),
+            ] {
+                ui.selectable_value(&mut self.tab, tab, label);
+            }
+        });
+        ui.separator();
+        egui::ScrollArea::vertical().show(ui, |ui| match self.tab {
+            Tab::View => self.view_tab(ui),
+            Tab::Planet => self.planet_tab(ui),
+            Tab::Terraform => self.terraform_tab(ui),
+            Tab::Settings => self.settings_tab(ui),
+        });
+    }
+
+    fn view_tab(&mut self, ui: &mut egui::Ui) {
         section(ui, "Overlay");
         let before = self.overlay;
-        for o in Overlay::ALL {
-            ui.radio_value(&mut self.overlay, o, o.label());
+        egui::ComboBox::from_id_salt("overlay")
+            .selected_text(self.overlay.label())
+            .width(220.0)
+            .show_ui(ui, |ui| {
+                for o in Overlay::ALL {
+                    ui.selectable_value(&mut self.overlay, o, o.label());
+                }
+            });
+        if let Some(l) = &mut self.loaded {
+            if self.overlay != before {
+                l.colours_dirty = true;
+            }
+            ui.add_space(4.0);
+            legend_widget(ui, &l.legend);
         }
-        if self.overlay != before {
-            self.recolour();
-        }
-        ui.add_space(4.0);
-        legend_widget(ui, &self.legend);
 
         ui.add_space(8.0);
-        section(ui, "View");
+        section(ui, "Display");
         ui.checkbox(&mut self.sunlit, "Day and night lighting");
         ui.checkbox(&mut self.borders, "Cell borders");
+        ui.checkbox(&mut self.wind_arrows, "Wind arrows");
+        if ui
+            .add(
+                egui::Slider::new(&mut self.relief, 0.0..=80.0)
+                    .text("relief exaggeration")
+                    .suffix("×"),
+            )
+            .changed()
+            && let Some(l) = &mut self.loaded
+        {
+            l.positions_dirty = true;
+        }
 
+        if let Some(l) = &self.loaded {
+            ui.add_space(8.0);
+            section(ui, "Planet now");
+            let s = &l.summary;
+            let state = l.world.state();
+            egui::Grid::new("summary")
+                .num_columns(2)
+                .spacing([12.0, 2.0])
+                .show(ui, |ui| {
+                    row(
+                        ui,
+                        "Mean temperature",
+                        format!("{:.1} °C", s.mean_temperature - 273.15),
+                    );
+                    row(
+                        ui,
+                        "Range",
+                        format!(
+                            "{:.0} to {:.0} °C",
+                            s.min_temperature - 273.15,
+                            s.max_temperature - 273.15
+                        ),
+                    );
+                    row(
+                        ui,
+                        "Ice and snow cover",
+                        format!("{:.1}%", s.ice_fraction * 100.0),
+                    );
+                    row(
+                        ui,
+                        "Cloud cover",
+                        format!("{:.0}%", s.cloud_fraction * 100.0),
+                    );
+                    row(
+                        ui,
+                        "Rain and snow",
+                        format!("{:.2} mm/day", s.precipitation),
+                    );
+                    row(ui, "Planet albedo", format!("{:.2}", s.planetary_albedo));
+                    row(
+                        ui,
+                        "Ocean",
+                        format!(
+                            "{:.0}% of surface",
+                            state.terrain.ocean_fraction(&state.grid) * 100.0
+                        ),
+                    );
+                    row(
+                        ui,
+                        "CO₂",
+                        format!(
+                            "{} ppm",
+                            overlay::group(
+                                state.planet().atmosphere.ppm(state.planet().atmosphere.co2) as f32
+                            )
+                        ),
+                    );
+                });
+        }
+    }
+
+    fn planet_tab(&mut self, ui: &mut egui::Ui) {
+        let Some(l) = &mut self.loaded else {
+            ui.label("No world yet.");
+            return;
+        };
+        ui.label(
+            RichText::new("Changes apply live. The climate takes a few planet years to settle into its new balance.")
+                .weak()
+                .small(),
+        );
+        let mut planet = l.world.state().planet().clone();
+        let earth_flux = Preset::EarthModern.params().mean_flux();
+        if crate::planet_editor::planet_editor(ui, &mut planet, earth_flux) {
+            match l.world.set_planet(planet) {
+                Ok(()) => {
+                    self.error = None;
+                    l.positions_dirty = true;
+                    l.colours_dirty = true;
+                }
+                Err(e) => self.error = Some(e),
+            }
+        }
         ui.add_space(8.0);
         section(ui, "Time");
-        let mut k = self.world.state().time_model().season_speed;
-        let slider = ui
+        let mut k = l.world.state().time_model().season_speed;
+        if ui
             .add(
                 egui::Slider::new(&mut k, 1.0..=5_000.0)
                     .logarithmic(true)
@@ -261,61 +481,144 @@ impl DirtboxApp {
             .on_hover_text(
                 "How fast days and seasons pass compared with creatures' lives. \
                  1 = fully realistic. Creatures' bodies always run in real time.",
-            );
-        if slider.changed() {
-            if let Err(e) = self.world.set_season_speed(k) {
-                log_error(&e);
-            }
+            )
+            .changed()
+            && let Err(e) = l.world.set_season_speed(k)
+        {
+            self.error = Some(e);
         }
-        let cal = self.world.state().calendar();
+        let cal = l.world.state().calendar();
         ui.label(
             RichText::new(format!(
-                "1 planet day = {}\n1 planet year = {}",
+                "1 planet day = {} · 1 planet year = {} of sim time",
                 duration(cal.day_length / k),
                 duration(cal.year_length / k)
             ))
-            .weak(),
+            .weak()
+            .small(),
         );
-
         ui.add_space(8.0);
-        section(ui, "Grid");
-        let current = self.grid().subdivision();
-        let mut chosen = current;
-        egui::ComboBox::from_id_salt("grid")
-            .selected_text(format!(
-                "{} cells",
-                overlay::group(GeodesicGrid::cell_count_for(current) as f32)
-            ))
-            .show_ui(ui, |ui| {
-                for n in GRID_CHOICES {
-                    let cells = GeodesicGrid::cell_count_for(n);
-                    let spacing = (4.0 * std::f64::consts::PI / cells as f64 * 2.0 / 3f64.sqrt())
-                        .sqrt()
-                        * EARTH_RADIUS
-                        / 1000.0;
-                    ui.selectable_value(
-                        &mut chosen,
-                        n,
-                        format!(
-                            "{} cells (~{:.0} km)",
-                            overlay::group(cells as f32),
-                            spacing
-                        ),
-                    );
+        section(ui, "Geology");
+        let params = &mut l.world.state_mut().climate.params;
+        ui.checkbox(&mut params.carbon_cycle, "Carbon–silicate cycle").on_hover_text(
+            "Volcanoes add CO₂; rain and warmth weather rock and remove it. Over geological time this \
+             acts as a thermostat. Off by default because it slowly changes the atmosphere you set.",
+        );
+    }
+
+    fn terraform_tab(&mut self, ui: &mut egui::Ui) {
+        let t = &mut self.terraform;
+        ui.checkbox(&mut t.active, RichText::new("Brush active").strong());
+        ui.label(
+            RichText::new("While active: left-drag paints, right-drag rotates, scroll zooms.")
+                .weak()
+                .small(),
+        );
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            for (tool, label, help) in [
+                (
+                    Tool::Raise,
+                    "Raise",
+                    "Push the ground up: mountains, islands, continents.",
+                ),
+                (
+                    Tool::Lower,
+                    "Lower",
+                    "Dig down: valleys, seas, ocean basins.",
+                ),
+                (Tool::Smooth, "Smooth", "Even out bumps."),
+                (
+                    Tool::Flatten,
+                    "Flatten",
+                    "Level to the height where the stroke starts.",
+                ),
+            ] {
+                ui.selectable_value(&mut t.tool, tool, label)
+                    .on_hover_text(help);
+            }
+        });
+        ui.add(
+            egui::Slider::new(&mut t.radius_km, 50.0..=3_000.0)
+                .logarithmic(true)
+                .text("radius")
+                .suffix(" km"),
+        );
+        match t.tool {
+            Tool::Raise | Tool::Lower => {
+                ui.add(
+                    egui::Slider::new(&mut t.strength, 50.0..=5_000.0)
+                        .logarithmic(true)
+                        .text("strength")
+                        .suffix(" m/s"),
+                );
+            }
+            Tool::Smooth | Tool::Flatten => {
+                let mut rate = (t.strength / 5_000.0).clamp(0.01, 1.0);
+                if ui
+                    .add(egui::Slider::new(&mut rate, 0.01..=1.0).text("strength"))
+                    .changed()
+                {
+                    t.strength = rate * 5_000.0;
                 }
-            });
-        if chosen != current {
-            self.rebuild_world(chosen);
+            }
+        }
+        ui.add_space(10.0);
+        section(ui, "Sea level");
+        let mut level = t.sea_level;
+        let response = ui.add(
+            egui::Slider::new(&mut level, -6_000.0..=6_000.0)
+                .text("sea level")
+                .suffix(" m")
+                .step_by(10.0),
+        );
+        t.sea_level = level;
+        if (response.drag_stopped() || (response.changed() && !response.dragged()))
+            && let Some(l) = &mut self.loaded
+        {
+            l.world.set_sea_level(level);
+            l.positions_dirty = true;
+            l.colours_dirty = true;
         }
         ui.label(
-            RichText::new("Changing the grid restarts the world.")
+            RichText::new(
+                "Applies when you let go. Raising it floods the land; lowering it drains the seas.",
+            )
+            .weak()
+            .small(),
+        );
+        if let Some(l) = &self.loaded {
+            let state = l.world.state();
+            ui.label(
+                RichText::new(format!(
+                    "Ocean covers {:.1}% of the surface.",
+                    state.terrain.ocean_fraction(&state.grid) * 100.0
+                ))
+                .weak()
+                .small(),
+            );
+        }
+    }
+
+    fn settings_tab(&mut self, ui: &mut egui::Ui) {
+        let Some(l) = &mut self.loaded else { return };
+        section(ui, "World");
+        let state = l.world.state();
+        ui.label(format!(
+            "Seed {} · {} cells (~{:.0} km apart)",
+            state.seed(),
+            overlay::group(state.grid.cell_count() as f32),
+            cell_spacing_km(&state.grid, state.planet().body.radius_km)
+        ));
+        ui.label(
+            RichText::new("Use “New world…” to change the preset, seed or grid.")
                 .weak()
                 .small(),
         );
 
         ui.add_space(8.0);
         section(ui, "Evolution");
-        let mut evo = self.world.state().evolution().clone();
+        let mut evo = l.world.state().evolution().clone();
         let mut changed = false;
         changed |= ui
             .add(
@@ -361,78 +664,29 @@ impl DirtboxApp {
                 .on_hover_text("Applies after DNA repair, so it can't be evolved away.")
                 .changed();
         });
-        if changed {
-            if let Err(e) = self.world.set_evolution(evo) {
-                log_error(&e);
-            }
+        if changed && let Err(e) = l.world.set_evolution(evo) {
+            self.error = Some(e);
         }
         ui.label(
             RichText::new("Takes effect once life exists (Phase 2).")
                 .weak()
                 .small(),
         );
-
-        ui.add_space(8.0);
-        section(ui, "Cell");
-        self.cell_inspector(ui);
-    }
-
-    fn cell_inspector(&self, ui: &mut egui::Ui) {
-        let Some(cell) = self.hovered.or(self.selected) else {
-            ui.label(RichText::new("Hover over or click a cell.").weak());
-            return;
-        };
-        let g = self.grid();
-        let p = g.position(cell);
-        let r_km = EARTH_RADIUS / 1000.0;
-        egui::Grid::new("cell")
-            .num_columns(2)
-            .spacing([12.0, 2.0])
-            .show(ui, |ui| {
-                ui.label("Cell");
-                ui.label(format!(
-                    "#{cell}{}",
-                    if Some(cell) == self.selected && self.hovered != self.selected {
-                        " (selected)"
-                    } else {
-                        ""
-                    }
-                ));
-                ui.end_row();
-                ui.label("Position");
-                ui.label(lat_lon(p));
-                ui.end_row();
-                ui.label("Area");
-                ui.label(format!(
-                    "{} km²",
-                    overlay::group((g.area(cell) * r_km * r_km) as f32)
-                ));
-                ui.end_row();
-                ui.label("Shape");
-                ui.label(if g.neighbours(cell).len() == 5 {
-                    "pentagon"
-                } else {
-                    "hexagon"
-                });
-                ui.end_row();
-                // Area already has its own row above.
-                if let Some(text) = self
-                    .overlay
-                    .describe(self.values[cell as usize])
-                    .filter(|_| self.overlay != Overlay::CellArea)
-                {
-                    ui.label(self.overlay.label());
-                    ui.label(text);
-                    ui.end_row();
-                }
-            });
     }
 
     fn globe(&mut self, ui: &mut egui::Ui) {
         let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
         let aspect = rect.width() / rect.height().max(1.0);
+        let dt = ui.input(|i| i.stable_dt);
 
-        if response.dragged() {
+        let painting_tool = self.terraform.active && self.loaded.is_some();
+        let rotate = if painting_tool {
+            response.dragged_by(egui::PointerButton::Secondary)
+                || response.dragged_by(egui::PointerButton::Middle)
+        } else {
+            response.dragged()
+        };
+        if rotate {
             let d = response.drag_delta();
             self.camera.drag(d.x, d.y, rect.height());
         }
@@ -443,42 +697,100 @@ impl DirtboxApp {
                 self.camera.zoom(amount);
             }
         }
-        if self.camera.update(ui.input(|i| i.stable_dt)) {
+        if self.camera.update(dt) {
             ui.ctx().request_repaint();
         }
+
+        if self.loaded.is_none() {
+            self.loading_screen(ui, rect);
+            return;
+        }
+        let l = self.loaded.as_mut().expect("checked above");
 
         let picked = response.hover_pos().and_then(|pos| {
             let ndc_x = (pos.x - rect.left()) / rect.width() * 2.0 - 1.0;
             let ndc_y = 1.0 - (pos.y - rect.top()) / rect.height() * 2.0;
             self.camera.pick(ndc_x, ndc_y, aspect)
         });
+        let grid = &l.world.state().grid;
         self.hovered = picked.map(|(x, y, z)| {
             let v = Vec3::new(x as f64, y as f64, z as f64);
             match self.hovered {
-                Some(hint) => self.grid().locate_from(hint, v),
-                None => self.grid().locate(v),
+                Some(hint) if (hint as usize) < grid.cell_count() => grid.locate_from(hint, v),
+                _ => grid.locate(v),
             }
         });
-        if response.clicked() {
+        if response.clicked() && !painting_tool {
             self.selected = self.hovered;
         }
 
-        let sun = self.sun();
+        // Terraforming.
+        let radius_km = l.world.state().planet().body.radius_km;
+        let brush_radius = (self.terraform.radius_km / radius_km) as f32;
+        let painting = painting_tool && response.dragged_by(egui::PointerButton::Primary);
+        if painting_tool && !painting {
+            self.terraform.flatten_target = None;
+        }
+        if painting && let Some((x, y, z)) = picked {
+            let centre = Vec3::new(x as f64, y as f64, z as f64);
+            let t = &mut self.terraform;
+            if t.flatten_target.is_none() {
+                let c = l.world.state().grid.locate(centre);
+                t.flatten_target = Some(l.world.state().terrain.elevation[c as usize]);
+            }
+            let dt = dt as f64;
+            let blend = (t.strength / 5_000.0 * dt * 4.0).clamp(0.0, 1.0);
+            let (mode, amount) = match t.tool {
+                Tool::Raise => (BrushMode::Raise, t.strength * dt),
+                Tool::Lower => (BrushMode::Lower, t.strength * dt),
+                Tool::Smooth => (BrushMode::Smooth, blend),
+                Tool::Flatten => (
+                    BrushMode::Flatten {
+                        target: t.flatten_target.unwrap_or(0.0),
+                    },
+                    blend,
+                ),
+            };
+            let changed = l.world.apply_brush(&Brush {
+                mode,
+                centre,
+                radius: brush_radius as f64,
+                amount,
+            });
+            if !changed.is_empty() {
+                l.positions_dirty = true;
+                l.colours_dirty = true;
+            }
+            ui.ctx().request_repaint();
+        }
+
+        let state = l.world.state();
+        let sun = state.planet().sun_state(state.planet_seconds()).direction;
+        let view_proj = self.camera.view_proj(aspect);
         let uniforms = FrameUniforms {
-            view_proj: self.camera.view_proj(aspect),
+            view_proj,
             eye: self.camera.eye(),
             sun: (sun.x as f32, sun.y as f32, sun.z as f32),
             sunlit: self.sunlit,
-            // Fade borders out from far away, where cells are only a few pixels.
             borders: if self.borders {
-                let cells_across = (self.grid().cell_count() as f32).sqrt();
+                let cells_across = (state.grid.cell_count() as f32).sqrt();
                 let px_per_cell =
                     rect.height() / cells_across * (2.2 / (self.camera.altitude() + 0.2));
                 ((px_per_cell - 4.0) / 8.0).clamp(0.0, 1.0)
             } else {
                 0.0
             },
-            hovered: self.hovered.or(self.selected),
+            relief: if self.relief > 0.0 { 1.0 } else { 0.0 },
+            hovered: if painting_tool {
+                None
+            } else {
+                self.hovered.or(self.selected)
+            },
+            brush: if painting_tool {
+                picked.map(|p| (p, brush_radius))
+            } else {
+                None
+            },
         };
         let renderer = self.renderer.clone();
         let callback = egui_glow::CallbackFn::new(move |info, painter| {
@@ -494,34 +806,156 @@ impl DirtboxApp {
             callback: Arc::new(callback),
         });
 
+        if self.wind_arrows || self.overlay == Overlay::Wind {
+            draw_wind_arrows(ui, rect, &view_proj, self.camera.eye(), state);
+        }
+
         let painter = ui.painter();
         let weak = ui.visuals().weak_text_color();
         painter.text(
             rect.left_bottom() + egui::vec2(12.0, -10.0),
             egui::Align2::LEFT_BOTTOM,
-            "Drag to rotate · scroll to zoom · click a cell to select",
+            if painting_tool {
+                "Left-drag to terraform · right-drag to rotate · scroll to zoom"
+            } else {
+                "Drag to rotate · scroll to zoom · click a cell to select"
+            },
             egui::FontId::proportional(12.0),
             weak,
         );
         painter.text(
-            rect.right_top() + egui::vec2(-12.0, 10.0),
-            egui::Align2::RIGHT_TOP,
+            rect.right_bottom() + egui::vec2(-12.0, -10.0),
+            egui::Align2::RIGHT_BOTTOM,
             format!(
                 "Altitude {} km",
-                overlay::group(self.camera.altitude() * (EARTH_RADIUS / 1000.0) as f32)
+                overlay::group(self.camera.altitude() * radius_km as f32)
             ),
             egui::FontId::proportional(12.0),
             weak,
         );
+
+        if let Some(cell) = self.hovered.or(self.selected) {
+            let pinned = self.hovered.is_none();
+            let overlay = self.overlay;
+            egui::Area::new(egui::Id::new("inspector"))
+                .fixed_pos(rect.right_top() + egui::vec2(-12.0, 12.0))
+                .pivot(egui::Align2::RIGHT_TOP)
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.set_max_width(260.0);
+                        cell_inspector(ui, l, overlay, cell, pinned);
+                    });
+                });
+        }
+    }
+
+    fn loading_screen(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let painter = ui.painter();
+        let (text, progress) = match &self.pending {
+            Some(p) => (
+                format!("Creating {}… settling the climate", p.recipe.preset.name()),
+                p.progress(),
+            ),
+            None => ("No world. Use “New world…” to make one.".to_string(), 0.0),
+        };
+        painter.text(
+            rect.center() - egui::vec2(0.0, 18.0),
+            egui::Align2::CENTER_CENTER,
+            text,
+            egui::FontId::proportional(18.0),
+            ui.visuals().text_color(),
+        );
+        if self.pending.is_some() {
+            let bar = egui::Rect::from_center_size(
+                rect.center() + egui::vec2(0.0, 14.0),
+                egui::vec2(320.0, 6.0),
+            );
+            painter.rect_filled(bar, 3.0, ui.visuals().extreme_bg_color);
+            let mut done = bar;
+            done.set_width(bar.width() * progress.clamp(0.02, 1.0) as f32);
+            painter.rect_filled(done, 3.0, ui.visuals().selection.bg_fill);
+        }
+    }
+
+    fn new_world_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_new_world;
+        let mut create = false;
+        egui::Window::new("New world")
+            .open(&mut open)
+            .resizable(false)
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(ctx.content_rect().center())
+            .show(ctx, |ui| {
+                let r = &mut self.recipe;
+                egui::Grid::new("recipe").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                    ui.label("Start from");
+                    egui::ComboBox::from_id_salt("preset")
+                        .selected_text(r.preset.name())
+                        .width(240.0)
+                        .show_ui(ui, |ui| {
+                            for p in Preset::ALL {
+                                ui.selectable_value(&mut r.preset, p, p.name()).on_hover_text(p.description());
+                            }
+                        });
+                    ui.end_row();
+                    ui.label("");
+                    ui.add(egui::Label::new(RichText::new(r.preset.description()).weak().small()).wrap());
+                    ui.end_row();
+                    ui.label("Terrain seed");
+                    ui.horizontal(|ui| {
+                        ui.add(egui::DragValue::new(&mut r.seed).range(0..=u32::MAX as u64));
+                        if ui.button("Random").clicked() {
+                            r.seed = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map_or(7, |d| d.subsec_nanos() as u64 % 100_000);
+                        }
+                    });
+                    ui.end_row();
+                    ui.label("Grid");
+                    egui::ComboBox::from_id_salt("grid")
+                        .selected_text(format!(
+                            "{} cells",
+                            overlay::group(GeodesicGrid::cell_count_for(r.subdivision) as f32)
+                        ))
+                        .show_ui(ui, |ui| {
+                            for n in GRID_CHOICES {
+                                let cells = GeodesicGrid::cell_count_for(n);
+                                let note = match n {
+                                    16 => " · fastest",
+                                    32 => " · recommended",
+                                    128 => " · slow climate",
+                                    _ => "",
+                                };
+                                ui.selectable_value(
+                                    &mut r.subdivision,
+                                    n,
+                                    format!("{} cells{note}", overlay::group(cells as f32)),
+                                );
+                            }
+                        });
+                    ui.end_row();
+                    ui.label("Climate spin-up");
+                    ui.add(egui::Slider::new(&mut r.spin_up_years, 0..=20).suffix(" planet years"))
+                        .on_hover_text("Simulated before the world appears, so it starts close to its natural balance.");
+                    ui.end_row();
+                });
+                ui.add_space(6.0);
+                create = ui.add_enabled(self.pending.is_none(), egui::Button::new("Create world")).clicked();
+            });
+        if create {
+            self.pending = Some(PendingWorld::start(self.recipe.clone(), ctx.clone()));
+            open = false;
+        }
+        self.show_new_world = open;
     }
 
     fn performance_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_performance;
         egui::Window::new("Performance")
             .open(&mut open)
+            .resizable(false)
             .pivot(egui::Align2::CENTER_CENTER)
             .default_pos(ctx.content_rect().center())
-            .resizable(false)
             .default_width(520.0)
             .show(ctx, |ui| {
                 ui.label(
@@ -539,26 +973,27 @@ impl DirtboxApp {
                     .num_columns(2)
                     .spacing([12.0, 2.0])
                     .show(ui, |ui| {
-                        ui.label("CPU");
-                        ui.label(format!(
-                            "{} ({} logical cores)",
-                            self.hw.cpu_model.as_deref().unwrap_or("unknown model"),
-                            self.hw.logical_cores
-                        ));
-                        ui.end_row();
-                        ui.label("Memory");
-                        ui.label(format!(
-                            "{} total, {} available",
-                            ram(self.hw.total_ram_bytes),
-                            ram(self.hw.available_ram_bytes)
-                        ));
-                        ui.end_row();
-                        ui.label("Graphics");
-                        ui.label(&self.gl_info);
-                        ui.end_row();
+                        row(
+                            ui,
+                            "CPU",
+                            format!(
+                                "{} ({} logical cores)",
+                                self.hw.cpu_model.as_deref().unwrap_or("unknown model"),
+                                self.hw.logical_cores
+                            ),
+                        );
+                        row(
+                            ui,
+                            "Memory",
+                            format!(
+                                "{} total, {} available",
+                                ram(self.hw.total_ram_bytes),
+                                ram(self.hw.available_ram_bytes)
+                            ),
+                        );
+                        row(ui, "Graphics", self.gl_info.clone());
                     });
                 ui.add_space(6.0);
-
                 match &self.calibration {
                     Calibration::NotRun => {
                         if ui.button("Run calibration (about 4 seconds)").clicked() {
@@ -579,15 +1014,17 @@ impl DirtboxApp {
                             throughput / 1e6,
                             result.all.threads
                         ));
-                        let state = self.world.state();
-                        let k = state.time_model().season_speed;
+                        let year_sim_seconds = self.loaded.as_ref().map_or(438_000.0, |l| {
+                            let s = l.world.state();
+                            s.calendar().year_length / s.time_model().season_speed
+                        });
                         let inputs = BudgetInputs {
                             throughput,
                             mean_step_seconds: BudgetInputs::DEFAULT_MEAN_STEP_SECONDS,
                             headroom: BudgetInputs::DEFAULT_HEADROOM,
                             bytes_per_organism: BudgetInputs::DEFAULT_BYTES_PER_ORGANISM,
                             available_ram_bytes: self.hw.available_ram_bytes,
-                            planet_year_sim_seconds: state.calendar().year_length / k,
+                            planet_year_sim_seconds: year_sim_seconds,
                         };
                         ui.add_space(4.0);
                         let mut choice = self.population_budget;
@@ -676,18 +1113,36 @@ impl eframe::App for DirtboxApp {
         if self.calibration.is_running() {
             ctx.request_repaint();
         }
+        if let Some(p) = &self.pending {
+            match p.poll() {
+                Some(Ok(world)) => {
+                    self.pending = None;
+                    self.install(world);
+                }
+                Some(Err(e)) => {
+                    self.pending = None;
+                    self.error = Some(e);
+                }
+                None => ctx.request_repaint_after(Duration::from_millis(100)),
+            }
+        }
         self.advance_time(&ctx);
+        self.refresh_display();
 
         egui::Panel::top("top").show(ui, |ui| self.top_bar(ui));
-        egui::Panel::left("world")
+        egui::Panel::left("side")
             .resizable(false)
-            .exact_size(300.0)
+            .exact_size(320.0)
             .show(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| self.world_panel(ui));
+                if let Some(e) = &self.error {
+                    ui.label(RichText::new(e).color(ui.visuals().error_fg_color));
+                }
+                self.side_panel(ui);
             });
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(BACKGROUND))
             .show(ui, |ui| self.globe(ui));
+        self.new_world_window(&ctx);
         self.performance_window(&ctx);
     }
 
@@ -704,52 +1159,269 @@ impl eframe::App for DirtboxApp {
     }
 }
 
+fn cell_inspector(ui: &mut egui::Ui, l: &Loaded, overlay: Overlay, cell: CellId, pinned: bool) {
+    let state = l.world.state();
+    let i = cell as usize;
+    let c = &state.climate;
+    let t = &state.terrain;
+    let p = state.grid.position(cell);
+    let ocean = t.is_ocean(cell);
+    let surface = if ocean {
+        if c.is_ice_covered(cell) {
+            "Sea ice"
+        } else {
+            "Ocean"
+        }
+    } else if c.lake[i] {
+        "Lake"
+    } else if c.snow[i] > 100.0 {
+        "Snow-covered land"
+    } else {
+        "Land"
+    };
+    ui.label(
+        RichText::new(format!(
+            "{surface}{}",
+            if pinned { " (selected)" } else { "" }
+        ))
+        .strong(),
+    );
+    egui::Grid::new("cell")
+        .num_columns(2)
+        .spacing([12.0, 2.0])
+        .show(ui, |ui| {
+            row(ui, "Position", lat_lon(p));
+            let h = t.height_above_sea(cell);
+            row(
+                ui,
+                if h < 0.0 { "Depth" } else { "Height" },
+                format!("{} m", overlay::group(h.abs() as f32)),
+            );
+            row(
+                ui,
+                "Temperature",
+                format!("{:.1} °C", c.temperature[i] - 273.15),
+            );
+            row(
+                ui,
+                "Rain and snow",
+                format!("{:.1} mm/day", c.precipitation[i] * 86_400.0),
+            );
+            if let Some(year) = &c.stats.last_year {
+                row(
+                    ui,
+                    "Per year",
+                    format!("{} mm", overlay::group(year.annual_precipitation(i) as f32)),
+                );
+                row(ui, "Climate", year.zones[i].label().to_string());
+            }
+            row(
+                ui,
+                "Wind",
+                format!(
+                    "{:.1} m/s from {}",
+                    c.wind[i].length(),
+                    overlay::wind_from(&state.grid, cell, c.wind[i])
+                ),
+            );
+            row(ui, "Cloud", format!("{:.0}%", c.cloud[i] * 100.0));
+            row(ui, "Sunlight", format!("{:.0} W/m²", c.insolation[i]));
+            if ocean && c.sea_ice[i] > 0.01 {
+                row(ui, "Sea ice", format!("{:.2} m", c.sea_ice[i]));
+            }
+            if !ocean {
+                if c.snow[i] > 1.0 {
+                    row(ui, "Snow", format!("{:.0} cm water", c.snow[i] / 10.0));
+                }
+                row(
+                    ui,
+                    "Soil water",
+                    format!("{:.0}%", c.soil[i] / c.params.soil_capacity * 100.0),
+                );
+                if c.river_flow[i] > 1.0 {
+                    row(
+                        ui,
+                        "River",
+                        format!("{} m³/s", overlay::group(c.river_flow[i] as f32)),
+                    );
+                }
+            }
+            if t.vents[i] > 0.0 {
+                row(
+                    ui,
+                    "Hydrothermal vents",
+                    format!("{:.0}% strength", t.vents[i] * 100.0),
+                );
+            }
+            if let Some(text) = l.values.get(i).and_then(|&v| overlay::describe(overlay, v))
+                && !matches!(
+                    overlay,
+                    Overlay::Temperature
+                        | Overlay::Precipitation
+                        | Overlay::Clouds
+                        | Overlay::Sunlight
+                        | Overlay::Elevation
+                )
+            {
+                row(ui, overlay.label(), text);
+            }
+        });
+}
+
+fn draw_wind_arrows(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    view_proj: &Mat4,
+    eye: V3,
+    state: &dirtbox_sim::WorldState,
+) {
+    let grid = &state.grid;
+    let eye_len = (eye.0 * eye.0 + eye.1 * eye.1 + eye.2 * eye.2).sqrt();
+    let eye_dir = Vec3::new(
+        (eye.0 / eye_len) as f64,
+        (eye.1 / eye_len) as f64,
+        (eye.2 / eye_len) as f64,
+    );
+    // Visible cap: points whose angle to the eye is inside the horizon.
+    let horizon = (1.0 / eye_len as f64).min(1.0);
+    let visible_fraction = ((1.0 - horizon) / 2.0).max(1e-3);
+    let step = ((grid.cell_count() as f64 * visible_fraction / 900.0).ceil() as usize).max(1);
+    let spacing = (4.0 * std::f64::consts::PI / grid.cell_count() as f64).sqrt();
+    let project = |p: Vec3| -> Option<egui::Pos2> {
+        let m = &view_proj.0;
+        let v = [p.x as f32, p.y as f32, p.z as f32, 1.0];
+        let clip: Vec<f32> = (0..4)
+            .map(|r| (0..4).map(|k| m[k * 4 + r] * v[k]).sum())
+            .collect();
+        if clip[3] <= 0.0 {
+            return None;
+        }
+        Some(egui::pos2(
+            rect.left() + (clip[0] / clip[3] + 1.0) / 2.0 * rect.width(),
+            rect.top() + (1.0 - clip[1] / clip[3]) / 2.0 * rect.height(),
+        ))
+    };
+    let painter = ui.painter_at(rect);
+    let stroke = egui::Stroke::new(1.2, Color32::from_rgba_unmultiplied(255, 255, 255, 170));
+    for c in grid.cells().step_by(step) {
+        let p = grid.position(c);
+        if p.dot(eye_dir) < horizon + 0.05 {
+            continue;
+        }
+        let w = state.climate.wind[c as usize];
+        if w.length() < 0.3 {
+            continue;
+        }
+        let lift = 1.002;
+        let end = (p + w * (spacing * step as f64 * 0.8 / 12.0)).normalized();
+        let (Some(a), Some(b)) = (project(p * lift), project(end * lift)) else {
+            continue;
+        };
+        painter.line_segment([a, b], stroke);
+        let dir = (b - a).normalized();
+        let side = egui::vec2(-dir.y, dir.x);
+        painter.line_segment([b, b - dir * 4.0 + side * 2.4], stroke);
+        painter.line_segment([b, b - dir * 4.0 - side * 2.4], stroke);
+    }
+}
+
 fn section(ui: &mut egui::Ui, title: &str) {
     ui.label(RichText::new(title).strong());
 }
 
+fn row(ui: &mut egui::Ui, label: &str, value: String) {
+    ui.label(RichText::new(label).weak());
+    ui.label(value);
+    ui.end_row();
+}
+
 fn legend_widget(ui: &mut egui::Ui, legend: &Legend) {
-    if legend.scale != Scale::None {
-        let (rect, _) =
-            ui.allocate_exact_size(egui::vec2(ui.available_width(), 10.0), Sense::hover());
-        let steps = 64;
-        for i in 0..steps {
-            let t = i as f32 / (steps - 1) as f32;
-            let [r, g, b] = match legend.scale {
-                Scale::Diverging => overlay::diverging(t * 2.0 - 1.0),
-                _ => overlay::sequential(t),
-            };
-            let x0 = rect.left() + rect.width() * i as f32 / steps as f32;
-            let x1 = rect.left() + rect.width() * (i + 1) as f32 / steps as f32;
-            ui.painter().rect_filled(
-                egui::Rect::from_min_max(
-                    egui::pos2(x0, rect.top()),
-                    egui::pos2(x1 + 0.5, rect.bottom()),
-                ),
-                0.0,
-                Color32::from_rgb(r, g, b),
-            );
-        }
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(&legend.low).small());
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(RichText::new(&legend.high).small());
-                if let Some(mid) = &legend.mid {
-                    ui.centered_and_justified(|ui| ui.label(RichText::new(mid).small()));
-                }
+    match legend.scale {
+        Scale::Sequential | Scale::Diverging => {
+            let (rect, _) =
+                ui.allocate_exact_size(egui::vec2(ui.available_width(), 10.0), Sense::hover());
+            let steps = 64;
+            for i in 0..steps {
+                let t = i as f32 / (steps - 1) as f32;
+                let [r, g, b] = match legend.scale {
+                    Scale::Diverging => overlay::diverging(t * 2.0 - 1.0),
+                    _ => overlay::sequential(t),
+                };
+                let x0 = rect.left() + rect.width() * i as f32 / steps as f32;
+                let x1 = rect.left() + rect.width() * (i + 1) as f32 / steps as f32;
+                ui.painter().rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(x0, rect.top()),
+                        egui::pos2(x1 + 0.5, rect.bottom()),
+                    ),
+                    0.0,
+                    Color32::from_rgb(r, g, b),
+                );
+            }
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(&legend.low).small());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(RichText::new(&legend.high).small());
+                    if let Some(mid) = &legend.mid {
+                        ui.centered_and_justified(|ui| ui.label(RichText::new(mid).small()));
+                    }
+                });
             });
-        });
+        }
+        Scale::Categorical => {
+            for g in ZoneGroup::ALL {
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), Sense::hover());
+                    let [cr, cg, cb] = g.colour();
+                    ui.painter()
+                        .rect_filled(r, 2.0, Color32::from_rgb(cr, cg, cb));
+                    ui.label(RichText::new(g.label()).small());
+                });
+            }
+        }
+        Scale::None => {}
     }
     if !legend.note.is_empty() {
         ui.label(RichText::new(legend.note).weak().small());
     }
 }
 
+fn planet_date(state: &dirtbox_sim::WorldState) -> String {
+    let cal = state.calendar();
+    let planet = state.planet_seconds();
+    let year = (planet / cal.year_length).floor() as u64 + 1;
+    let p = state.planet();
+    if p.rotation.tidally_locked {
+        return format!(
+            "Planet year {year}, {:.0}% through",
+            cal.year_fraction(planet) * 100.0
+        );
+    }
+    let day = ((planet % cal.year_length) / cal.day_length).floor() as u64 + 1;
+    let local = cal.day_fraction(planet) * 24.0;
+    let season = if p.orbit.obliquity.to_degrees() < 3.0 {
+        "no seasons".to_string()
+    } else {
+        let lambda = p.sun_state(planet).solar_longitude.to_degrees();
+        let north = ["spring", "summer", "autumn", "winter"][((lambda / 90.0) as usize).min(3)];
+        format!("northern {north}")
+    };
+    format!(
+        "Year {year}, day {day} · {:02}:{:02} at 0° · {season}",
+        local.floor() as u32,
+        (local.fract() * 60.0).floor() as u32
+    )
+}
+
+fn cell_spacing_km(grid: &GeodesicGrid, radius_km: f64) -> f64 {
+    (4.0 * std::f64::consts::PI / grid.cell_count() as f64 * 2.0 / 3f64.sqrt()).sqrt() * radius_km
+}
+
 fn lat_lon(p: Vec3) -> String {
     let lat = p.latitude().to_degrees();
     let lon = p.longitude().to_degrees();
     format!(
-        "{:.2}° {}, {:.2}° {}",
+        "{:.1}° {}, {:.1}° {}",
         lat.abs(),
         if lat >= 0.0 { "N" } else { "S" },
         lon.abs(),
@@ -775,10 +1447,6 @@ fn duration(seconds: f64) -> String {
         s if s < 48.0 * 3600.0 => format!("{:.1} h", s / 3600.0),
         s => format!("{:.2} days", s / 86_400.0),
     }
-}
-
-fn log_error(e: &str) {
-    eprintln!("dirtbox-viewer: {e}");
 }
 
 #[cfg(test)]

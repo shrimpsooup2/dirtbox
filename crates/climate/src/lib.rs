@@ -984,3 +984,165 @@ fn smoothstep(e0: f64, e1: f64, x: f64) -> f64 {
     let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }
+
+/// Brings a new climate close to equilibrium quickly: runs `years` planet
+/// years on a coarse grid (daily-mean steps), then maps the result onto the
+/// full grid, correcting temperatures for the height differences. The
+/// returned climate corresponds to planet time `years × year length`, so use a
+/// whole number of years to land back on the starting season.
+///
+/// `progress` is called with the fraction done (0–1).
+pub fn spin_up(
+    grid: &GeodesicGrid,
+    planet: &PlanetParams,
+    terrain: &Terrain,
+    params: ClimateParams,
+    frozen: bool,
+    years: f64,
+    progress: &mut dyn FnMut(f64),
+) -> Climate {
+    const COARSE: u32 = 16;
+    let mut fine = Climate::new(grid, planet, terrain, params.clone(), frozen);
+    if years <= 0.0 {
+        progress(1.0);
+        return fine;
+    }
+    let coarse_grid = GeodesicGrid::new(COARSE.min(grid.subdivision()));
+    // Coarse terrain: the mean height of the fine cells that fall in each coarse cell.
+    let mut sum = vec![0.0; coarse_grid.cell_count()];
+    let mut count = vec![0usize; coarse_grid.cell_count()];
+    let mut owner = vec![0 as CellId; grid.cell_count()];
+    let mut hint = 0;
+    for c in grid.cells() {
+        let k = coarse_grid.locate_from(hint, grid.position(c));
+        hint = k;
+        owner[c as usize] = k;
+        sum[k as usize] += terrain.elevation[c as usize];
+        count[k as usize] += 1;
+    }
+    let coarse_elevation: Vec<f64> = coarse_grid
+        .cells()
+        .map(|k| {
+            let i = k as usize;
+            if count[i] > 0 {
+                sum[i] / count[i] as f64
+            } else {
+                terrain.elevation[grid.locate(coarse_grid.position(k)) as usize]
+            }
+        })
+        .collect();
+    let coarse_terrain =
+        Terrain::from_elevation(&coarse_grid, coarse_elevation, terrain.sea_level());
+    let mut coarse = Climate::new(&coarse_grid, planet, &coarse_terrain, params, frozen);
+
+    let dt = planet.calendar().day_length.min(86_400.0);
+    let steps = (years * planet.year_seconds() / dt).round().max(1.0) as usize;
+    let mut t = 0.0;
+    for s in 0..steps {
+        coarse.step(&StepInputs {
+            grid: &coarse_grid,
+            planet,
+            terrain: &coarse_terrain,
+            start: t,
+            dt,
+            mode: StepMode::DailyMean,
+            geologic_rate: 0.0,
+        });
+        t += dt;
+        if s % 16 == 0 {
+            progress(s as f64 / steps as f64);
+        }
+    }
+
+    // Map onto the fine grid.
+    let g = planet.body.gravity();
+    let lapse = fine.params.lapse_rate * g / EARTH_GRAVITY;
+    let land_height = |t: &Terrain, c: CellId| {
+        if t.is_ocean(c) {
+            0.0
+        } else {
+            t.height_above_sea(c).max(0.0)
+        }
+    };
+    for c in grid.cells() {
+        let i = c as usize;
+        let k = owner[i];
+        let ki = k as usize;
+        let dh = land_height(terrain, c) - land_height(&coarse_terrain, k);
+        let t_new = coarse.temperature[ki] - lapse * dh;
+        fine.temperature[i] = t_new;
+        fine.vapour[i] = coarse.vapour[ki].min(saturated_column_water(t_new, g));
+        let fine_ocean = terrain.is_ocean(c);
+        let coarse_ocean = coarse_terrain.is_ocean(k);
+        if fine_ocean {
+            fine.sea_ice[i] = if coarse_ocean {
+                coarse.sea_ice[ki]
+            } else if t_new < FREEZING_SEA {
+                1.0
+            } else {
+                0.0
+            };
+            fine.temperature[i] = if fine.sea_ice[i] >= fine.params.ice_cover_thickness {
+                t_new.min(FREEZING_FRESH)
+            } else {
+                t_new.max(FREEZING_SEA)
+            };
+        } else {
+            fine.snow[i] = if coarse_ocean { 0.0 } else { coarse.snow[ki] };
+            fine.soil[i] = if coarse_ocean {
+                0.5 * fine.params.soil_capacity
+            } else {
+                coarse.soil[ki]
+            };
+        }
+        fine.wind[i] = coarse.wind[ki];
+        fine.cloud[i] = coarse.cloud[ki];
+        fine.precipitation[i] = coarse.precipitation[ki];
+    }
+    // The mapped state defines the new water baseline.
+    fine.ocean_water = 0.0;
+    progress(1.0);
+    fine
+}
+
+impl Climate {
+    /// Rebuilds the physical geometry for a new planet radius. Per-area
+    /// quantities (temperature, water columns) are kept.
+    pub fn set_radius(&mut self, grid: &GeodesicGrid, radius: f64) {
+        self.radius = radius;
+        self.geo = Geometry::new(grid, radius);
+    }
+}
+
+#[cfg(test)]
+mod spin_up_tests {
+    use super::*;
+    use dirtbox_planet::Preset;
+
+    #[test]
+    fn spin_up_lands_near_the_coarse_equilibrium() {
+        let planet = Preset::EarthModern.params();
+        let grid = GeodesicGrid::new(24);
+        let terrain = Terrain::generate(&grid, &planet, 1);
+        let mut calls = 0;
+        let climate = spin_up(
+            &grid,
+            &planet,
+            &terrain,
+            ClimateParams::default(),
+            false,
+            4.0,
+            &mut |_| calls += 1,
+        );
+        assert!(calls > 1);
+        let mean = climate
+            .temperature
+            .iter()
+            .zip(grid.cells())
+            .map(|(t, c)| t * grid.area(c))
+            .sum::<f64>()
+            / (4.0 * std::f64::consts::PI);
+        assert!((280.0..295.0).contains(&mean), "{mean}");
+        assert!(climate.temperature.iter().all(|t| t.is_finite()));
+    }
+}

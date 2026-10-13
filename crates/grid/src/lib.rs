@@ -131,6 +131,14 @@ impl GeodesicGrid {
             .map(|&t| self.circumcentres[t as usize])
     }
 
+    /// Mesh triangle behind each corner of the cell polygon (same order as
+    /// [`corners`](Self::corners)); index into [`triangles`](Self::triangles).
+    pub fn corner_triangles(&self, cell: CellId) -> &[u32] {
+        let c = cell as usize;
+        &self.corner_list
+            [self.neighbour_offsets[c] as usize..self.neighbour_offsets[c + 1] as usize]
+    }
+
     /// Index range of a cell's entries in the per-neighbour (CSR) arrays.
     pub fn neighbour_range(&self, cell: CellId) -> std::ops::Range<usize> {
         let c = cell as usize;

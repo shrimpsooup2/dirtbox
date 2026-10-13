@@ -1,7 +1,12 @@
 //! The world: shared state plus the systems that advance it.
 
+use std::time::{Duration, Instant};
+
+use dirtbox_climate::{Climate, ClimateParams, StepInputs, StepMode};
 use dirtbox_core::{Calendar, PlanetClock, Rng, SimTime, TimeModel};
+use dirtbox_grid::CellId;
 use dirtbox_grid::GeodesicGrid;
+use dirtbox_planet::{Brush, PlanetParams, Preset, Terrain};
 
 use crate::hash::StateHasher;
 use crate::schedule::{Cadence, Clock, Slot, StepContext, System};
@@ -11,7 +16,13 @@ use crate::settings::{EvolutionSettings, MutationBoost};
 pub struct WorldConfig {
     pub seed: u64,
     pub time: TimeModel,
-    pub calendar: Calendar,
+    pub planet: PlanetParams,
+    /// Start with frozen oceans and snow-covered land.
+    pub start_frozen: bool,
+    pub climate: ClimateParams,
+    /// Whether to register the climate system (tests of the scheduler alone
+    /// switch it off).
+    pub run_climate: bool,
     /// Geodesic subdivision for environment fields (10n² + 2 cells).
     pub grid_subdivision: u32,
     pub evolution: EvolutionSettings,
@@ -19,11 +30,20 @@ pub struct WorldConfig {
 
 impl Default for WorldConfig {
     fn default() -> Self {
+        Self::from_preset(Preset::EarthModern)
+    }
+}
+
+impl WorldConfig {
+    pub fn from_preset(preset: Preset) -> Self {
         Self {
             seed: 0,
             time: TimeModel::default(),
-            calendar: Calendar::default(),
-            grid_subdivision: 64, // 40,962 cells
+            planet: preset.params(),
+            start_frozen: preset.starts_frozen(),
+            climate: ClimateParams::default(),
+            run_climate: true,
+            grid_subdivision: 32, // 10,242 cells, ~240 km apart on Earth
             evolution: EvolutionSettings::default(),
         }
     }
@@ -38,7 +58,11 @@ pub struct WorldState {
     calendar: Calendar,
     planet_clock: PlanetClock,
     evolution: EvolutionSettings,
+    planet: PlanetParams,
+    climate_mode: StepMode,
     pub grid: GeodesicGrid,
+    pub terrain: Terrain,
+    pub climate: Climate,
 }
 
 impl WorldState {
@@ -54,12 +78,21 @@ impl WorldState {
         &self.time_model
     }
 
+    /// Day and year lengths, derived from the planet's orbit and rotation.
     pub fn calendar(&self) -> &Calendar {
         &self.calendar
     }
 
     pub fn evolution(&self) -> &EvolutionSettings {
         &self.evolution
+    }
+
+    pub fn planet(&self) -> &PlanetParams {
+        &self.planet
+    }
+
+    pub fn climate_mode(&self) -> StepMode {
+        self.climate_mode
     }
 
     pub fn planet_seconds(&self) -> f64 {
@@ -87,6 +120,29 @@ impl WorldState {
             MutationBoost::Environmental => 0,
             MutationBoost::Fixed => 1,
         });
+        h.write_f64(self.planet.atmosphere.co2);
+        for i in 0..self.grid.cell_count() {
+            h.write_f64(self.terrain.elevation[i]);
+            h.write_f64(self.climate.temperature[i]);
+            h.write_f64(self.climate.vapour[i]);
+            h.write_f64(self.climate.sea_ice[i]);
+            h.write_f64(self.climate.snow[i]);
+        }
+    }
+
+    /// Advances the climate over `[start, start + dt)` of planet time.
+    pub fn step_climate(&mut self, start: f64, dt: f64) {
+        let geologic_rate = self.time_model.geologic_acceleration / self.calendar.year_length;
+        let report = self.climate.step(&StepInputs {
+            grid: &self.grid,
+            planet: &self.planet,
+            terrain: &self.terrain,
+            start,
+            dt,
+            mode: self.climate_mode,
+            geologic_rate,
+        });
+        self.planet.atmosphere.co2 = (self.planet.atmosphere.co2 + report.co2_change).max(0.0);
     }
 
     /// First sim time strictly after `now` that lands on a multiple of the
@@ -117,6 +173,30 @@ impl WorldState {
     }
 }
 
+/// Runs the climate on the planet clock: hourly steps with day and night, or
+/// day-long steps with daily-mean sunlight for fast running.
+pub struct ClimateSystem;
+
+impl System for ClimateSystem {
+    fn name(&self) -> &'static str {
+        "climate"
+    }
+
+    fn cadence(&self, state: &WorldState) -> Cadence {
+        Cadence::planet_seconds(match state.climate_mode {
+            StepMode::Diurnal => 3_600.0,
+            StepMode::DailyMean => state.calendar.day_length.min(86_400.0),
+        })
+    }
+
+    fn run(&mut self, state: &mut WorldState, ctx: &StepContext) {
+        let dt = ctx.elapsed_planet_seconds;
+        if dt > 0.0 {
+            state.step_climate(ctx.planet_seconds - dt, dt);
+        }
+    }
+}
+
 pub struct World {
     state: WorldState,
     slots: Vec<Slot>,
@@ -124,24 +204,64 @@ pub struct World {
 
 impl World {
     pub fn new(config: WorldConfig) -> Result<Self, String> {
+        Self::build(config, 0.0, &mut |_| {})
+    }
+
+    /// Builds a world and settles its climate for `spin_up_years` (on a
+    /// coarse grid, then mapped to the full one). `progress` reports 0–1.
+    pub fn with_spin_up(
+        config: WorldConfig,
+        spin_up_years: f64,
+        progress: &mut dyn FnMut(f64),
+    ) -> Result<Self, String> {
+        Self::build(config, spin_up_years, progress)
+    }
+
+    fn build(
+        config: WorldConfig,
+        spin_up_years: f64,
+        progress: &mut dyn FnMut(f64),
+    ) -> Result<Self, String> {
         config.time.validate()?;
         config.evolution.validate()?;
-        if config.calendar.day_length <= 0.0 || config.calendar.year_length <= 0.0 {
-            return Err("calendar day and year lengths must be > 0".into());
+        config.planet.validate()?;
+        if !(1..=512).contains(&config.grid_subdivision) {
+            return Err("grid subdivision must be 1–512".into());
         }
+        let grid = GeodesicGrid::new(config.grid_subdivision);
+        let terrain = Terrain::generate(&grid, &config.planet, config.seed);
+        let years = spin_up_years.round();
+        let climate = dirtbox_climate::spin_up(
+            &grid,
+            &config.planet,
+            &terrain,
+            config.climate.clone(),
+            config.start_frozen,
+            years,
+            progress,
+        );
+        let calendar = config.planet.calendar();
         let state = WorldState {
             seed: config.seed,
             now: SimTime::ZERO,
             planet_clock: PlanetClock::new(config.time.season_speed),
             time_model: config.time,
-            calendar: config.calendar,
+            calendar,
             evolution: config.evolution,
-            grid: GeodesicGrid::new(config.grid_subdivision),
+            planet: config.planet,
+            climate_mode: StepMode::Diurnal,
+            grid,
+            terrain,
+            climate,
         };
-        Ok(Self {
+        let mut world = Self {
             state,
             slots: Vec::new(),
-        })
+        };
+        if config.run_climate {
+            world.add_system(Box::new(ClimateSystem));
+        }
+        Ok(world)
     }
 
     pub fn state(&self) -> &WorldState {
@@ -153,7 +273,7 @@ impl World {
     }
 
     pub fn add_system(&mut self, system: Box<dyn System>) {
-        let cadence = system.cadence();
+        let cadence = system.cadence(&self.state);
         assert!(
             cadence.period.is_finite() && cadence.period > 0.0,
             "{}: period must be > 0",
@@ -172,6 +292,18 @@ impl World {
         self.slots.iter().map(|s| s.system.name())
     }
 
+    /// Recomputes when each planet- and geologic-clock system is next due
+    /// (after the clock or calendar changed).
+    fn reschedule(&mut self) {
+        let now = self.state.now;
+        for slot in &mut self.slots {
+            let cadence = slot.system.cadence(&self.state);
+            if cadence.clock != Clock::Sim {
+                slot.next_due = self.state.next_due(cadence, now);
+            }
+        }
+    }
+
     /// Changes the season speed from now on. Planet time stays continuous.
     pub fn set_season_speed(&mut self, season_speed: f64) -> Result<(), String> {
         if !(season_speed.is_finite() && season_speed > 0.0) {
@@ -180,13 +312,53 @@ impl World {
         let now = self.state.now;
         self.state.planet_clock.set_season_speed(now, season_speed);
         self.state.time_model.season_speed = season_speed;
-        for slot in &mut self.slots {
-            let cadence = slot.system.cadence();
-            if cadence.clock != Clock::Sim {
-                slot.next_due = self.state.next_due(cadence, now);
-            }
-        }
+        self.reschedule();
         Ok(())
+    }
+
+    /// Switches between hourly (day and night) and daily-mean climate steps.
+    pub fn set_climate_mode(&mut self, mode: StepMode) {
+        if self.state.climate_mode != mode {
+            self.state.climate_mode = mode;
+            self.reschedule();
+        }
+    }
+
+    /// Replaces the planet's parameters while the world runs (orbit, star,
+    /// atmosphere, rotation…). Planet time carries on; the calendar follows
+    /// the new orbit. Changing the radius rescales the climate's geometry.
+    pub fn set_planet(&mut self, planet: PlanetParams) -> Result<(), String> {
+        planet.validate()?;
+        if planet.body.radius() != self.state.planet.body.radius() {
+            self.state
+                .climate
+                .set_radius(&self.state.grid, planet.body.radius());
+        }
+        self.state.calendar = planet.calendar();
+        self.state.planet = planet;
+        self.reschedule();
+        Ok(())
+    }
+
+    /// Terraforms with a brush. Returns the cells that changed.
+    pub fn apply_brush(&mut self, brush: &Brush) -> Vec<CellId> {
+        let was_ocean = self.state.terrain.ocean_mask().to_vec();
+        let changed = self.state.terrain.apply_brush(&self.state.grid, brush);
+        if !changed.is_empty() {
+            self.state
+                .climate
+                .terrain_changed(&self.state.grid, &self.state.terrain, &was_ocean);
+        }
+        changed
+    }
+
+    /// Moves the sea level, flooding or draining the planet.
+    pub fn set_sea_level(&mut self, level: f64) {
+        let was_ocean = self.state.terrain.ocean_mask().to_vec();
+        self.state.terrain.set_sea_level(&self.state.grid, level);
+        self.state
+            .climate
+            .terrain_changed(&self.state.grid, &self.state.terrain, &was_ocean);
     }
 
     /// Changes the player's evolution-speed settings; takes effect immediately.
@@ -204,8 +376,19 @@ impl World {
     /// Runs every system due up to and including `end`, then leaves the clock
     /// at `end`. Returns the number of system runs.
     pub fn run_until(&mut self, end: SimTime) -> u64 {
+        self.run_until_within(end, None).0
+    }
+
+    /// Like [`run_until`](Self::run_until), but stops early once `budget` of
+    /// wall time has been spent. Returns the number of system runs and the
+    /// sim time actually reached (≤ `end`).
+    pub fn run_until_within(&mut self, end: SimTime, budget: Option<Duration>) -> (u64, SimTime) {
+        let started = Instant::now();
         let mut runs = 0;
         while let Some(t) = self.next_event().filter(|&t| t <= end) {
+            if budget.is_some_and(|b| started.elapsed() >= b) {
+                return (runs, self.state.now);
+            }
             self.state.now = t;
             let planet_seconds = self.state.planet_seconds();
             let geologic_years = self.state.geologic_years();
@@ -224,12 +407,12 @@ impl World {
                 slot.system.run(&mut self.state, &ctx);
                 slot.last_run = t;
                 slot.last_run_planet = planet_seconds;
-                slot.next_due = self.state.next_due(slot.system.cadence(), t);
+                slot.next_due = self.state.next_due(slot.system.cadence(&self.state), t);
                 runs += 1;
             }
         }
         self.state.now = self.state.now.max(end);
-        runs
+        (runs, self.state.now)
     }
 
     pub fn state_hash(&self) -> u64 {
@@ -260,7 +443,7 @@ mod tests {
         fn name(&self) -> &'static str {
             self.name
         }
-        fn cadence(&self) -> Cadence {
+        fn cadence(&self, _: &WorldState) -> Cadence {
             self.cadence
         }
         fn run(&mut self, state: &mut WorldState, ctx: &StepContext) {
@@ -277,6 +460,7 @@ mod tests {
         let mut w = World::new(WorldConfig {
             seed,
             grid_subdivision: 2,
+            run_climate: false,
             ..Default::default()
         })
         .unwrap();
@@ -373,7 +557,7 @@ mod tests {
             fn name(&self) -> &'static str {
                 "check"
             }
-            fn cadence(&self) -> Cadence {
+            fn cadence(&self, _: &WorldState) -> Cadence {
                 Cadence::planet_seconds(3600.0)
             }
             fn run(&mut self, _: &mut WorldState, ctx: &StepContext) {
@@ -383,10 +567,74 @@ mod tests {
         }
         let mut w = World::new(WorldConfig {
             grid_subdivision: 1,
+            run_climate: false,
             ..Default::default()
         })
         .unwrap();
         w.add_system(Box::new(Check));
         assert_eq!(w.run_until(SimTime::from_seconds_ceil(500.0)), 10);
+    }
+
+    #[test]
+    fn climate_runs_on_the_planet_clock_and_is_deterministic() {
+        let config = WorldConfig {
+            grid_subdivision: 6,
+            ..Default::default()
+        };
+        let run = || {
+            let mut w = World::new(config.clone()).unwrap();
+            // Two planet days at the default season speed (40 sim-minutes).
+            let runs = w.run_until(SimTime::from_seconds_ceil(2_400.0));
+            (runs, w.state_hash())
+        };
+        let (runs, h1) = run();
+        assert_eq!(runs, 48, "hourly climate steps");
+        assert_eq!(run().1, h1);
+        let mut w = World::new(config).unwrap();
+        w.set_climate_mode(StepMode::DailyMean);
+        assert_eq!(w.run_until(SimTime::from_seconds_ceil(2_400.0)), 2);
+    }
+
+    #[test]
+    fn budgeted_runs_stop_early_and_resume() {
+        let mut w = World::new(WorldConfig {
+            grid_subdivision: 8,
+            ..Default::default()
+        })
+        .unwrap();
+        let end = SimTime::from_seconds_ceil(86_400.0 * 30.0);
+        let (_, reached) = w.run_until_within(end, Some(Duration::from_millis(1)));
+        assert!(reached < end);
+        assert!(w.state().now() == reached);
+    }
+
+    #[test]
+    fn planet_edits_and_terraforming_apply_live() {
+        let mut w = World::new(WorldConfig {
+            grid_subdivision: 8,
+            ..Default::default()
+        })
+        .unwrap();
+        let mut planet = w.state().planet().clone();
+        planet.orbit.semi_major_axis = 1.5;
+        w.set_planet(planet).unwrap();
+        assert!(w.state().calendar().year_length > 1.8 * 365.0 * 86_400.0);
+        let mut bad = w.state().planet().clone();
+        bad.orbit.eccentricity = 2.0;
+        assert!(w.set_planet(bad).is_err());
+
+        let before = w.state().terrain.ocean_fraction(&w.state().grid);
+        w.set_sea_level(300.0);
+        assert!(w.state().terrain.ocean_fraction(&w.state().grid) > before);
+        let centre = w.state().grid.position(0);
+        let changed = w.apply_brush(&Brush {
+            mode: dirtbox_planet::BrushMode::Raise,
+            centre,
+            radius: 0.3,
+            amount: 2_000.0,
+        });
+        assert!(!changed.is_empty());
+        w.run_until(SimTime::from_seconds_ceil(1_200.0));
+        assert!(w.state().climate.temperature.iter().all(|t| t.is_finite()));
     }
 }

@@ -1,12 +1,15 @@
 //! OpenGL renderer for the geodesic globe.
 //!
-//! Each cell is drawn as a fan of triangles from its centre to its Voronoi
-//! corners. A per-vertex "edge" attribute is 0 at the centre and 1 on the
-//! polygon boundary, and the fragment shader turns values near 1 into
-//! pixel-width cell borders, so no separate line pass is needed.
+//! Each cell is a fan of triangles from its centre to its Voronoi corners. A
+//! per-vertex "edge" attribute is 0 at the centre and 1 on the polygon
+//! boundary; the fragment shader turns values near 1 into pixel-width cell
+//! borders. Vertices are lifted by (exaggerated) terrain height: centres by
+//! their cell's height, corners by the mean of the three cells that meet
+//! there, which gives a continuous surface.
 
 use egui_glow::glow::{self, HasContext};
 
+use dirtbox_core::Vec3;
 use dirtbox_grid::{CellId, GeodesicGrid};
 
 use crate::camera::{Mat4, V3};
@@ -40,19 +43,25 @@ uniform vec3 u_eye;
 uniform vec3 u_sun;
 uniform float u_sunlit;
 uniform float u_borders;
+uniform float u_relief;
+uniform vec4 u_brush;
 out vec4 frag_colour;
 void main() {
-    vec3 n = normalize(v_pos);
+    vec3 up = normalize(v_pos);
     vec3 view = normalize(u_eye - v_pos);
+    // Facet normal from screen-space derivatives shows the relief.
+    vec3 facet = normalize(cross(dFdx(v_pos), dFdy(v_pos)));
+    if (dot(facet, up) < 0.0) facet = -facet;
+    vec3 n = normalize(mix(up, facet, u_relief));
 
-    // Sunlit: day side lit by the sun with a soft terminator; the night side
-    // keeps enough light for the map to stay readable. Even: a headlight.
-    float sun = dot(n, u_sun);
-    float day = 0.38 + 0.62 * smoothstep(-0.08, 0.35, sun);
+    // Day side lit by the star with a soft terminator (from the sphere
+    // normal, so mountains don't light up at night); relief adds shading.
+    float day = smoothstep(-0.08, 0.35, dot(up, u_sun));
+    float shade = 0.75 + 0.25 * clamp(dot(n, u_sun) / max(dot(up, u_sun), 0.2), 0.0, 1.6);
+    float sunlit = (0.38 + 0.62 * day) * mix(1.0, shade, u_relief * day);
     float even = 0.6 + 0.4 * max(dot(n, view), 0.0);
-    vec3 colour = v_colour * mix(even, day, u_sunlit);
+    vec3 colour = v_colour * mix(even, sunlit, u_sunlit);
 
-    // Cell borders, about one pixel wide at any zoom.
     float w = fwidth(v_edge);
     float border = smoothstep(1.0 - 1.6 * w, 1.0 - 0.4 * w, v_edge);
     colour = mix(colour, colour * 0.45, border * u_borders);
@@ -61,17 +70,28 @@ void main() {
         colour = mix(colour, vec3(1.0), 0.3 + 0.5 * border);
     }
 
-    // Thin atmosphere rim.
-    float rim = pow(1.0 - max(dot(n, view), 0.0), 4.0);
-    colour += vec3(0.30, 0.50, 0.95) * rim * 0.55;
+    // Terraforming brush preview.
+    if (u_brush.w > 0.0) {
+        float d = acos(clamp(dot(up, u_brush.xyz), -1.0, 1.0));
+        float wd = fwidth(d);
+        float ring = 1.0 - smoothstep(0.0, 2.0 * wd, abs(d - u_brush.w));
+        float inside = 1.0 - step(u_brush.w, d);
+        colour = mix(colour, vec3(1.0, 0.86, 0.45), inside * 0.12 + ring * 0.85);
+    }
 
+    float rim = pow(1.0 - max(dot(up, view), 0.0), 4.0);
+    colour += vec3(0.30, 0.50, 0.95) * rim * 0.55;
     frag_colour = vec4(colour, 1.0);
 }
 "#;
 
 /// CPU-side mesh for one grid.
 pub struct GlobeMesh {
-    positions: Vec<f32>,
+    /// Unit-sphere position of each vertex.
+    unit: Vec<Vec3>,
+    /// For corner vertices, the mesh triangle whose three cells set the
+    /// height; `u32::MAX` for cell centres.
+    corner_triangle: Vec<u32>,
     edge_cell: Vec<f32>,
     indices: Vec<u32>,
     /// Owning cell of each vertex, for expanding per-cell colours.
@@ -82,18 +102,18 @@ impl GlobeMesh {
     pub fn build(grid: &GeodesicGrid) -> Self {
         let n = grid.cell_count();
         let mut mesh = GlobeMesh {
-            positions: Vec::with_capacity(n * 7 * 3),
+            unit: Vec::with_capacity(n * 7),
+            corner_triangle: Vec::with_capacity(n * 7),
             edge_cell: Vec::with_capacity(n * 7 * 2),
             indices: Vec::with_capacity(n * 18),
             vertex_cell: Vec::with_capacity(n * 7),
         };
         for cell in grid.cells() {
             let base = mesh.vertex_cell.len() as u32;
-            let centre = grid.position(cell);
-            mesh.push(centre.x, centre.y, centre.z, 0.0, cell);
+            mesh.push(grid.position(cell), u32::MAX, 0.0, cell);
             let degree = grid.corners(cell).len() as u32;
-            for corner in grid.corners(cell) {
-                mesh.push(corner.x, corner.y, corner.z, 1.0, cell);
+            for (corner, &tri) in grid.corners(cell).zip(grid.corner_triangles(cell)) {
+                mesh.push(corner, tri, 1.0, cell);
             }
             for k in 0..degree {
                 mesh.indices
@@ -103,11 +123,41 @@ impl GlobeMesh {
         mesh
     }
 
-    fn push(&mut self, x: f64, y: f64, z: f64, edge: f32, cell: CellId) {
-        self.positions.extend([x as f32, y as f32, z as f32]);
+    fn push(&mut self, p: Vec3, tri: u32, edge: f32, cell: CellId) {
+        self.unit.push(p);
+        self.corner_triangle.push(tri);
         // Cell ids up to 2²⁴ are exact in f32; the grid caps far below that.
         self.edge_cell.extend([edge, cell as f32]);
         self.vertex_cell.push(cell);
+    }
+
+    /// Vertex positions with each cell lifted by `height` (m, per cell) ×
+    /// `exaggeration`, on a unit globe for a planet of `radius` m.
+    pub fn positions(
+        &self,
+        grid: &GeodesicGrid,
+        height: &[f64],
+        radius: f64,
+        exaggeration: f64,
+    ) -> Vec<f32> {
+        let scale = exaggeration / radius;
+        let tris = grid.triangles();
+        let mut out = Vec::with_capacity(self.unit.len() * 3);
+        for (v, &p) in self.unit.iter().enumerate() {
+            let h = match self.corner_triangle[v] {
+                u32::MAX => height[self.vertex_cell[v] as usize],
+                t => {
+                    tris[t as usize]
+                        .iter()
+                        .map(|&c| height[c as usize])
+                        .sum::<f64>()
+                        / 3.0
+                }
+            };
+            let q = p * (1.0 + scale * h);
+            out.extend([q.x as f32, q.y as f32, q.z as f32]);
+        }
+        out
     }
 
     pub fn expand_colours(&self, cell_colours: &[Rgb]) -> Vec<u8> {
@@ -126,7 +176,10 @@ pub struct FrameUniforms {
     pub sun: V3,
     pub sunlit: bool,
     pub borders: f32,
+    pub relief: f32,
     pub hovered: Option<CellId>,
+    /// Brush centre (unit vector) and radius (radians), if previewing.
+    pub brush: Option<(V3, f32)>,
 }
 
 pub struct GlobeRenderer {
@@ -137,7 +190,8 @@ pub struct GlobeRenderer {
     colour_buffer: glow::Buffer,
     index_buffer: glow::Buffer,
     index_count: i32,
-    pending_mesh: Option<(Vec<f32>, Vec<f32>, Vec<u32>)>,
+    pending_topology: Option<(Vec<f32>, Vec<u32>)>,
+    pending_positions: Option<Vec<f32>>,
     pending_colours: Option<Vec<u8>>,
 }
 
@@ -200,19 +254,21 @@ impl GlobeRenderer {
                 colour_buffer,
                 index_buffer,
                 index_count: 0,
-                pending_mesh: None,
+                pending_topology: None,
+                pending_positions: None,
                 pending_colours: None,
             })
         }
     }
 
-    /// Queues a new mesh; it is uploaded on the next paint.
+    /// Queues a new mesh topology; uploaded on the next paint.
     pub fn set_mesh(&mut self, mesh: &GlobeMesh) {
-        self.pending_mesh = Some((
-            mesh.positions.clone(),
-            mesh.edge_cell.clone(),
-            mesh.indices.clone(),
-        ));
+        self.pending_topology = Some((mesh.edge_cell.clone(), mesh.indices.clone()));
+    }
+
+    /// Queues new vertex positions (3 floats per vertex).
+    pub fn set_positions(&mut self, positions: Vec<f32>) {
+        self.pending_positions = Some(positions);
     }
 
     /// Queues new vertex colours (3 bytes per vertex).
@@ -222,13 +278,7 @@ impl GlobeRenderer {
 
     pub fn paint(&mut self, gl: &glow::Context, u: &FrameUniforms, viewport_px: [i32; 4]) {
         unsafe {
-            if let Some((positions, edge_cell, indices)) = self.pending_mesh.take() {
-                gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.position_buffer));
-                gl.buffer_data_u8_slice(
-                    glow::ARRAY_BUFFER,
-                    as_bytes(&positions),
-                    glow::STATIC_DRAW,
-                );
+            if let Some((edge_cell, indices)) = self.pending_topology.take() {
                 gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.edge_cell_buffer));
                 gl.buffer_data_u8_slice(
                     glow::ARRAY_BUFFER,
@@ -243,6 +293,14 @@ impl GlobeRenderer {
                 );
                 gl.bind_vertex_array(None);
                 self.index_count = indices.len() as i32;
+            }
+            if let Some(positions) = self.pending_positions.take() {
+                gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.position_buffer));
+                gl.buffer_data_u8_slice(
+                    glow::ARRAY_BUFFER,
+                    as_bytes(&positions),
+                    glow::DYNAMIC_DRAW,
+                );
             }
             if let Some(colours) = self.pending_colours.take() {
                 gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.colour_buffer));
@@ -274,15 +332,17 @@ impl GlobeRenderer {
             gl.uniform_3_f32(loc("u_sun").as_ref(), u.sun.0, u.sun.1, u.sun.2);
             gl.uniform_1_f32(loc("u_sunlit").as_ref(), if u.sunlit { 1.0 } else { 0.0 });
             gl.uniform_1_f32(loc("u_borders").as_ref(), u.borders);
+            gl.uniform_1_f32(loc("u_relief").as_ref(), u.relief);
             gl.uniform_1_f32(
                 loc("u_hovered").as_ref(),
                 u.hovered.map_or(-1.0, |c| c as f32),
             );
+            let (bc, br) = u.brush.unwrap_or(((0.0, 0.0, 1.0), -1.0));
+            gl.uniform_4_f32(loc("u_brush").as_ref(), bc.0, bc.1, bc.2, br);
 
             gl.bind_vertex_array(Some(self.vao));
             gl.draw_elements(glow::TRIANGLES, self.index_count, glow::UNSIGNED_INT, 0);
             gl.bind_vertex_array(None);
-            gl.depth_mask(false);
         }
     }
 
@@ -321,5 +381,24 @@ mod tests {
         assert_eq!(mesh.indices.len(), 3 * corners);
         let colours = mesh.expand_colours(&vec![[1, 2, 3]; grid.cell_count()]);
         assert_eq!(colours.len(), 3 * mesh.vertex_cell.len());
+    }
+
+    #[test]
+    fn relief_is_continuous_at_shared_corners() {
+        let grid = GeodesicGrid::new(5);
+        let mesh = GlobeMesh::build(&grid);
+        let height: Vec<f64> = grid.cells().map(|c| (c % 7) as f64 * 1000.0).collect();
+        let pos = mesh.positions(&grid, &height, 6.371e6, 50.0);
+        // Vertices for the same corner (same triangle) coincide exactly.
+        let mut seen = std::collections::HashMap::new();
+        for (v, &t) in mesh.corner_triangle.iter().enumerate() {
+            if t == u32::MAX {
+                continue;
+            }
+            let p = [pos[3 * v], pos[3 * v + 1], pos[3 * v + 2]];
+            if let Some(q) = seen.insert(t, p) {
+                assert_eq!(p, q, "corner of triangle {t} has two heights");
+            }
+        }
     }
 }
