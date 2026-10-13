@@ -35,6 +35,12 @@ pub struct GeodesicGrid {
     circumcentres: Vec<Vec3>,
     /// Triangles of the cell-centre mesh, counter-clockwise seen from outside.
     triangles: Vec<[CellId; 3]>,
+    /// Per neighbour entry (CSR): great-circle length of the shared edge and
+    /// distance between the two centres, both on the unit sphere, plus the unit
+    /// tangent at the cell centre pointing toward the neighbour.
+    edge_lengths: Vec<f64>,
+    centre_distances: Vec<f64>,
+    edge_normals: Vec<Vec3>,
     locator: Locator,
 }
 
@@ -66,8 +72,12 @@ impl GeodesicGrid {
             corner_list: cells.corners,
             circumcentres: cells.circumcentres,
             triangles,
+            edge_lengths: Vec::new(),
+            centre_distances: Vec::new(),
+            edge_normals: Vec::new(),
             locator: Locator::default(),
         };
+        grid.build_edge_geometry();
         grid.locator = Locator::build(&grid);
         grid
     }
@@ -119,6 +129,59 @@ impl GeodesicGrid {
         self.corner_list[start..end]
             .iter()
             .map(|&t| self.circumcentres[t as usize])
+    }
+
+    /// Index range of a cell's entries in the per-neighbour (CSR) arrays.
+    pub fn neighbour_range(&self, cell: CellId) -> std::ops::Range<usize> {
+        let c = cell as usize;
+        self.neighbour_offsets[c] as usize..self.neighbour_offsets[c + 1] as usize
+    }
+
+    /// Flat per-neighbour arrays, indexed by [`neighbour_range`](Self::neighbour_range).
+    pub fn neighbour_ids(&self) -> &[CellId] {
+        &self.neighbour_list
+    }
+
+    /// Great-circle length of each shared edge (unit sphere).
+    pub fn edge_lengths(&self) -> &[f64] {
+        &self.edge_lengths
+    }
+
+    /// Great-circle distance between each pair of neighbouring centres (unit sphere).
+    pub fn centre_distances(&self) -> &[f64] {
+        &self.centre_distances
+    }
+
+    /// Unit tangent at the cell centre pointing toward each neighbour.
+    pub fn edge_normals(&self) -> &[Vec3] {
+        &self.edge_normals
+    }
+
+    /// Local east and north unit vectors at a cell centre.
+    pub fn east_north(&self, cell: CellId) -> (Vec3, Vec3) {
+        east_north_at(self.position(cell))
+    }
+
+    fn build_edge_geometry(&mut self) {
+        let n = self.neighbour_list.len();
+        let mut edge_lengths = Vec::with_capacity(n);
+        let mut centre_distances = Vec::with_capacity(n);
+        let mut edge_normals = Vec::with_capacity(n);
+        for cell in self.cells() {
+            let p = self.position(cell);
+            let corners: Vec<Vec3> = self.corners(cell).collect();
+            let degree = corners.len();
+            for (k, &nb) in self.neighbours(cell).iter().enumerate() {
+                // The edge shared with neighbour k runs between corners k−1 and k.
+                edge_lengths.push(arc(corners[(k + degree - 1) % degree], corners[k]));
+                let q = self.position(nb);
+                centre_distances.push(arc(p, q));
+                edge_normals.push((q - p * p.dot(q)).normalized());
+            }
+        }
+        self.edge_lengths = edge_lengths;
+        self.centre_distances = centre_distances;
+        self.edge_normals = edge_normals;
     }
 
     pub fn triangles(&self) -> &[[CellId; 3]] {
@@ -254,6 +317,22 @@ fn build_mesh(n: u32) -> (Vec<Vec3>, Vec<[CellId; 3]>) {
         }
     }
     (positions, triangles)
+}
+
+/// Great-circle distance between two unit vectors.
+fn arc(a: Vec3, b: Vec3) -> f64 {
+    a.cross(b).length().atan2(a.dot(b))
+}
+
+/// East and north unit vectors at a point on the unit sphere.
+pub fn east_north_at(p: Vec3) -> (Vec3, Vec3) {
+    let east = Vec3::new(0.0, 0.0, 1.0).cross(p);
+    let east = if east.length() < 1e-12 {
+        Vec3::new(0.0, 1.0, 0.0)
+    } else {
+        east.normalized()
+    };
+    (east, p.cross(east))
 }
 
 /// Point a fraction `t` of the way along the great circle from `a` to `b`
@@ -494,6 +573,50 @@ mod tests {
                 assert!((q.dot(p) - q.dot(b)).abs() < 1e-12);
             }
         }
+    }
+
+    #[test]
+    fn edge_geometry_is_consistent() {
+        let g = GeodesicGrid::new(6);
+        for c in g.cells() {
+            let range = g.neighbour_range(c);
+            let mut closure = Vec3::ZERO;
+            let mut perimeter = 0.0;
+            for i in range.clone() {
+                let nb = g.neighbour_ids()[i];
+                // The same edge seen from the other side matches.
+                let j = g
+                    .neighbour_range(nb)
+                    .find(|&j| g.neighbour_ids()[j] == c)
+                    .unwrap();
+                assert!((g.edge_lengths()[i] - g.edge_lengths()[j]).abs() < 1e-12);
+                assert!((g.centre_distances()[i] - g.centre_distances()[j]).abs() < 1e-12);
+                let n = g.edge_normals()[i];
+                assert!(n.dot(g.position(c)).abs() < 1e-12, "normal not tangent");
+                assert!(
+                    n.dot(g.position(nb) - g.position(c)) > 0.0,
+                    "normal points away"
+                );
+                closure += n * g.edge_lengths()[i];
+                perimeter += g.edge_lengths()[i];
+            }
+            // Σ L·n around a closed cell is ~0 (discrete divergence theorem).
+            assert!(
+                closure.length() < 0.02 * perimeter,
+                "{}",
+                closure.length() / perimeter
+            );
+        }
+    }
+
+    #[test]
+    fn east_and_north_are_orthonormal_tangents() {
+        let p = Vec3::from_lat_lon(0.4, 1.1);
+        let (e, n) = east_north_at(p);
+        assert!(e.dot(p).abs() < 1e-12 && n.dot(p).abs() < 1e-12 && e.dot(n).abs() < 1e-12);
+        assert!((e.length() - 1.0).abs() < 1e-12 && (n.length() - 1.0).abs() < 1e-12);
+        assert!(n.z > 0.0, "north points north");
+        assert!(e.y > 0.0 || e.x.abs() > 0.0);
     }
 
     #[test]

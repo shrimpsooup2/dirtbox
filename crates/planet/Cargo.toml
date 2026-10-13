@@ -1,0 +1,10 @@
+[package]
+name = "dirtbox-planet"
+description = "Star, orbit, rotation, planet body, atmosphere, astronomy and terrain"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dirtbox-core.workspace = true
+dirtbox-grid.workspace = true

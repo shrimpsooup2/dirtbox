@@ -12,6 +12,12 @@ dirtbox-core = { path = "crates/core" }
 dirtbox-grid = { path = "crates/grid" }
 dirtbox-sim = { path = "crates/sim" }
 dirtbox-hw = { path = "crates/hw" }
+dirtbox-planet = { path = "crates/planet" }
+dirtbox-climate = { path = "crates/climate" }
 
 [profile.release]
 debug = 1
+
+# Climate tests run multi-year simulations; optimise them.
+[profile.test]
+opt-level = 3

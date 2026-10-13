@@ -1,5 +1,7 @@
 //! `dirtbox`: headless command-line entry point.
 
+mod climate_cmd;
+
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
@@ -26,6 +28,15 @@ COMMANDS:
                    --subdivision <n>    10n²+2 cells (default 64)
                    --cells <n>          pick the smallest subdivision with ≥ n cells
                    --radius-km <r>      planet radius (default 6371)
+    climate      Spin up a planet's climate headless and print zonal means
+                   --preset <name>      earth, early, cold, tidally, super, ocean, snowball (default earth)
+                   --years <y>          planet years to run (default 6)
+                   --subdivision <n>    grid subdivision (default 16)
+                   --seed <s>           terrain seed (default 1)
+                   --diurnal true       hourly steps with day and night (slower)
+                   --co2-ppm <ppm>      override CO₂
+                   --luminosity <f>     override the star's luminosity factor
+                   --report-days <d>    print progress every d planet days
     help         Show this message
 ";
 
@@ -40,6 +51,20 @@ fn main() -> ExitCode {
         "calibrate" => Options::parse(rest, &["seconds", "threads", "population", "season-speed"])
             .and_then(calibrate),
         "grid" => Options::parse(rest, &["subdivision", "cells", "radius-km"]).and_then(grid),
+        "climate" => Options::parse(
+            rest,
+            &[
+                "preset",
+                "years",
+                "subdivision",
+                "seed",
+                "diurnal",
+                "co2-ppm",
+                "luminosity",
+                "report-days",
+            ],
+        )
+        .and_then(climate),
         "help" | "--help" | "-h" => {
             print!("{USAGE}");
             Ok(())
@@ -219,6 +244,24 @@ fn calibrate(opts: Options) -> Result<(), String> {
         "  - These figures come from a stand-in workload. They will be re-measured once real organisms exist (Phases 4–5)."
     );
     Ok(())
+}
+
+fn climate(opts: Options) -> Result<(), String> {
+    let preset = climate_cmd::preset_by_name(
+        &opts
+            .get::<String>("preset")?
+            .unwrap_or_else(|| "earth".into()),
+    )?;
+    climate_cmd::run(climate_cmd::ClimateRun {
+        preset,
+        years: opts.get("years")?.unwrap_or(6.0),
+        subdivision: opts.get("subdivision")?.unwrap_or(16),
+        seed: opts.get("seed")?.unwrap_or(1),
+        diurnal: opts.get("diurnal")?.unwrap_or(false),
+        co2_ppm: opts.get("co2-ppm")?,
+        luminosity: opts.get("luminosity")?,
+        report_days: opts.get("report-days")?,
+    })
 }
 
 fn grid(opts: Options) -> Result<(), String> {

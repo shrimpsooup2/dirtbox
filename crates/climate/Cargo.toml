@@ -1,0 +1,12 @@
+[package]
+name = "dirtbox-climate"
+description = "Energy balance, wind, moisture, ice and hydrology on the geodesic grid"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dirtbox-core.workspace = true
+dirtbox-grid.workspace = true
+dirtbox-planet.workspace = true
+rayon = "1.10"
