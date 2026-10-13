@@ -14,4 +14,4 @@ pub mod world;
 pub use hash::StateHasher;
 pub use schedule::{Cadence, Clock, StepContext, System};
 pub use settings::{EvolutionSettings, MutationBoost};
-pub use world::{ClimateSystem, World, WorldConfig, WorldState};
+pub use world::{ClimateSystem, LIFE_STEP, LifeSystem, World, WorldConfig, WorldState};

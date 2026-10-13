@@ -1,0 +1,13 @@
+[package]
+name = "dirtbox-chemistry"
+description = "Element pools, microbial strain fields and their evolution"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dirtbox-core.workspace = true
+dirtbox-grid.workspace = true
+dirtbox-planet.workspace = true
+dirtbox-climate.workspace = true
+rayon = "1.10"

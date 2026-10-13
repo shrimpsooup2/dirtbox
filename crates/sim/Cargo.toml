@@ -10,3 +10,4 @@ dirtbox-core.workspace = true
 dirtbox-grid.workspace = true
 dirtbox-planet.workspace = true
 dirtbox-climate.workspace = true
+dirtbox-chemistry.workspace = true

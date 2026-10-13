@@ -88,6 +88,21 @@ impl Drainage {
         }
     }
 
+    /// The ocean cell where each land cell's water reaches the sea (`None`
+    /// for ocean cells, and for land on a world without an ocean).
+    pub fn outlets(&self, terrain: &Terrain) -> Vec<Option<CellId>> {
+        let mut outlet = vec![None; self.receiver.len()];
+        // Downstream first, so each receiver's outlet is already known.
+        for &c in self.order.iter().rev() {
+            outlet[c as usize] = match self.receiver[c as usize] {
+                Some(r) if terrain.is_ocean(r) => Some(r),
+                Some(r) => outlet[r as usize],
+                None => None,
+            };
+        }
+        outlet
+    }
+
     /// River discharge (kg s⁻¹ leaving each cell) from per-cell runoff rates
     /// (kg m⁻² s⁻¹) and areas (m²).
     pub fn accumulate(&self, runoff: &[f64], area: &[f64]) -> Vec<f64> {
@@ -134,6 +149,20 @@ mod tests {
         for c in grid.cells().filter(|&c| !terrain.is_ocean(c)) {
             let r = d.receiver[c as usize].expect("land cell without receiver");
             assert!(grid.neighbours(c).contains(&r));
+        }
+    }
+
+    #[test]
+    fn every_land_cell_has_an_ocean_outlet() {
+        let grid = GeodesicGrid::new(16);
+        let terrain = Terrain::generate(&grid, &Preset::EarthModern.params(), 2);
+        let d = Drainage::build(&grid, &terrain);
+        let outlets = d.outlets(&terrain);
+        for c in grid.cells() {
+            match outlets[c as usize] {
+                Some(o) => assert!(terrain.is_ocean(o) && !terrain.is_ocean(c)),
+                None => assert!(terrain.is_ocean(c)),
+            }
         }
     }
 

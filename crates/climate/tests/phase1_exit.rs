@@ -274,9 +274,14 @@ fn doubling_co2_warms_by_a_realistic_amount() {
         planet.atmosphere.co2 = co2_bar;
         let mut run = Run::new(16, planet, None, false);
         run.years(12.0);
-        run.climate.summary(&run.grid, &run.terrain).mean_temperature
+        run.climate
+            .summary(&run.grid, &run.terrain)
+            .mean_temperature
     };
     let warming = mean_after(560e-6) - mean_after(280e-6);
     // Observed equilibrium climate sensitivity: likely 2.5–4 K, very likely 2–5 K.
-    assert!((2.0..5.0).contains(&warming), "doubling CO₂ warmed by {warming:.2} K");
+    assert!(
+        (2.0..5.0).contains(&warming),
+        "doubling CO₂ warmed by {warming:.2} K"
+    );
 }

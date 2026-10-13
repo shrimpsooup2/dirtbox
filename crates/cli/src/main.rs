@@ -1,6 +1,7 @@
 //! `dirtbox`: headless command-line entry point.
 
 mod climate_cmd;
+mod life_cmd;
 
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -37,6 +38,16 @@ COMMANDS:
                    --co2-ppm <ppm>      override CO₂
                    --luminosity <f>     override the star's luminosity factor
                    --report-days <d>    print progress every d planet days
+    life         Run the microbial era headless and report what evolves
+                   --preset <name>      planet preset (default early)
+                   --years <y>          planet years to run (default 50)
+                   --subdivision <n>    grid subdivision (default 16)
+                   --seed <s>           world seed (default 1)
+                   --stride <d>         climate steps every d days (default 5)
+                   --mutation <x>       point-mutation multiplier (default 1)
+                   --structural <x>     structural-mutation multiplier (default 1)
+                   --until <milestone>  stop at a milestone, e.g. oxygenic, oxygen, predators
+                   --report-years <y>   print a line every y planet years (default 5)
     help         Show this message
 ";
 
@@ -65,6 +76,21 @@ fn main() -> ExitCode {
             ],
         )
         .and_then(climate),
+        "life" => Options::parse(
+            rest,
+            &[
+                "preset",
+                "years",
+                "subdivision",
+                "seed",
+                "stride",
+                "mutation",
+                "structural",
+                "until",
+                "report-years",
+            ],
+        )
+        .and_then(life),
         "help" | "--help" | "-h" => {
             print!("{USAGE}");
             Ok(())
@@ -337,4 +363,24 @@ fn duration(seconds: f64) -> String {
         s if s < 48.0 * 3600.0 => format!("{:.1} h", s / 3600.0),
         s => format!("{:.1} days", s / 86_400.0),
     }
+}
+
+fn life(o: Options) -> Result<(), String> {
+    let preset =
+        climate_cmd::preset_by_name(&o.get::<String>("preset")?.unwrap_or("early".into()))?;
+    let until = o
+        .get::<String>("until")?
+        .map(|m| life_cmd::milestone_by_name(&m))
+        .transpose()?;
+    life_cmd::run(life_cmd::LifeRun {
+        preset,
+        years: o.get("years")?.unwrap_or(50.0),
+        subdivision: o.get("subdivision")?.unwrap_or(16),
+        seed: o.get("seed")?.unwrap_or(1),
+        stride: o.get("stride")?.unwrap_or(5),
+        mutation: o.get("mutation")?.unwrap_or(1.0),
+        structural: o.get("structural")?.unwrap_or(1.0),
+        until,
+        report_years: o.get("report-years")?.unwrap_or(5.0),
+    })
 }

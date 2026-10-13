@@ -2,6 +2,7 @@
 
 use std::time::{Duration, Instant};
 
+use dirtbox_chemistry::{Biosphere, Environment, LifeParams, Milestone, MutationRates};
 use dirtbox_climate::{Climate, ClimateParams, StepInputs, StepMode};
 use dirtbox_core::{Calendar, PlanetClock, Rng, SimTime, TimeModel};
 use dirtbox_grid::CellId;
@@ -26,6 +27,13 @@ pub struct WorldConfig {
     /// Geodesic subdivision for environment fields (10n² + 2 cells).
     pub grid_subdivision: u32,
     pub evolution: EvolutionSettings,
+    /// Whether to register the life system (chemistry and microbes).
+    pub run_life: bool,
+    /// Seed base bacteria at the vents when the world is built.
+    pub seed_life: bool,
+    pub life: LifeParams,
+    /// Natural mutation rates of microbes, before the player's multipliers.
+    pub mutation_rates: MutationRates,
 }
 
 impl Default for WorldConfig {
@@ -45,6 +53,10 @@ impl WorldConfig {
             run_climate: true,
             grid_subdivision: 32, // 10,242 cells, ~240 km apart on Earth
             evolution: EvolutionSettings::default(),
+            run_life: true,
+            seed_life: true,
+            life: LifeParams::default(),
+            mutation_rates: MutationRates::default(),
         }
     }
 }
@@ -60,9 +72,14 @@ pub struct WorldState {
     evolution: EvolutionSettings,
     planet: PlanetParams,
     climate_mode: StepMode,
+    /// In daily-mean mode, the climate integrates one day in every this many
+    /// (fast forward); life still steps daily.
+    climate_stride: u32,
+    mutation_rates: MutationRates,
     pub grid: GeodesicGrid,
     pub terrain: Terrain,
     pub climate: Climate,
+    pub life: Biosphere,
 }
 
 impl WorldState {
@@ -93,6 +110,18 @@ impl WorldState {
 
     pub fn climate_mode(&self) -> StepMode {
         self.climate_mode
+    }
+
+    pub fn climate_stride(&self) -> u32 {
+        self.climate_stride
+    }
+
+    /// Microbial mutation rates with the player's multipliers applied.
+    pub fn mutation_rates(&self) -> MutationRates {
+        self.mutation_rates.scaled(
+            self.evolution.mutation_multiplier,
+            self.evolution.structural_multiplier,
+        )
     }
 
     pub fn planet_seconds(&self) -> f64 {
@@ -128,6 +157,9 @@ impl WorldState {
             h.write_f64(self.climate.sea_ice[i]);
             h.write_f64(self.climate.snow[i]);
         }
+        h.write_f64(self.planet.atmosphere.o2);
+        h.write_f64(self.planet.atmosphere.ch4);
+        self.life.hash_words(&mut |w| h.write_u64(w));
     }
 
     /// Advances the climate over `[start, start + dt)` of planet time.
@@ -143,6 +175,48 @@ impl WorldState {
             geologic_rate,
         });
         self.planet.atmosphere.co2 = (self.planet.atmosphere.co2 + report.co2_change).max(0.0);
+    }
+
+    /// Advances chemistry and microbes over `[start, start + dt)` of planet
+    /// time and applies their gas exchange to the atmosphere.
+    pub fn step_life(&mut self, start: f64, dt: f64) {
+        let geologic_years = dt / self.calendar.year_length * self.time_model.geologic_acceleration;
+        let rates = self.mutation_rates();
+        let env = Environment {
+            grid: &self.grid,
+            terrain: &self.terrain,
+            climate: &self.climate,
+            planet: &self.planet,
+            start,
+        };
+        let change = self.life.step(&env, dt, geologic_years, &rates);
+        change.apply(&mut self.planet);
+    }
+
+    /// Introduces a population of any genome into one cell, drawing its
+    /// carbon from the air. Returns the new strain's id.
+    pub fn introduce_strain(
+        &mut self,
+        cell: CellId,
+        genome: dirtbox_chemistry::Genome,
+        biomass: f64,
+    ) -> dirtbox_chemistry::StrainId {
+        let now = self.planet_seconds();
+        let id = self
+            .life
+            .introduce(self.climate.geometry(), cell, genome, biomass, now);
+        self.life.take_pending().apply(&mut self.planet);
+        id
+    }
+
+    pub fn seed_life(&mut self) -> Vec<CellId> {
+        let now = self.planet_seconds();
+        let cells = self
+            .life
+            .seed(&self.grid, &self.terrain, &self.climate, now);
+        let pending = self.life.take_pending();
+        pending.apply(&mut self.planet);
+        cells
     }
 
     /// First sim time strictly after `now` that lands on a multiple of the
@@ -185,14 +259,50 @@ impl System for ClimateSystem {
     fn cadence(&self, state: &WorldState) -> Cadence {
         Cadence::planet_seconds(match state.climate_mode {
             StepMode::Diurnal => 3_600.0,
-            StepMode::DailyMean => state.calendar.day_length.min(86_400.0),
+            StepMode::DailyMean => {
+                state.calendar.day_length.min(86_400.0) * state.climate_stride as f64
+            }
         })
+    }
+
+    fn run(&mut self, state: &mut WorldState, ctx: &StepContext) {
+        let elapsed = ctx.elapsed_planet_seconds;
+        if elapsed <= 0.0 {
+            return;
+        }
+        // With a stride, the climate integrates only the last day of each
+        // stretch: seasons still come at the right time and annual means hold,
+        // but the seasonal swing is damped. Long steps aren't stable, so this
+        // is the fast-forward instead.
+        let dt = if state.climate_mode == StepMode::DailyMean && state.climate_stride > 1 {
+            elapsed.min(state.calendar.day_length.min(86_400.0))
+        } else {
+            elapsed
+        };
+        state.step_climate(ctx.planet_seconds - dt, dt);
+    }
+}
+
+/// Runs chemistry and microbes once per planet day (design §12.3: strain
+/// fields step at planet-day resolution in fast eras).
+pub struct LifeSystem;
+
+/// How often the biosphere steps, planet seconds.
+pub const LIFE_STEP: f64 = 86_400.0;
+
+impl System for LifeSystem {
+    fn name(&self) -> &'static str {
+        "life"
+    }
+
+    fn cadence(&self, _: &WorldState) -> Cadence {
+        Cadence::planet_seconds(LIFE_STEP)
     }
 
     fn run(&mut self, state: &mut WorldState, ctx: &StepContext) {
         let dt = ctx.elapsed_planet_seconds;
         if dt > 0.0 {
-            state.step_climate(ctx.planet_seconds - dt, dt);
+            state.step_life(ctx.planet_seconds - dt, dt);
         }
     }
 }
@@ -241,7 +351,8 @@ impl World {
             progress,
         );
         let calendar = config.planet.calendar();
-        let state = WorldState {
+        let life = Biosphere::new(&grid, &terrain, &config.planet, config.life, config.seed);
+        let mut state = WorldState {
             seed: config.seed,
             now: SimTime::ZERO,
             planet_clock: PlanetClock::new(config.time.season_speed),
@@ -250,16 +361,25 @@ impl World {
             evolution: config.evolution,
             planet: config.planet,
             climate_mode: StepMode::Diurnal,
+            climate_stride: 1,
+            mutation_rates: config.mutation_rates,
             grid,
             terrain,
             climate,
+            life,
         };
+        if config.seed_life {
+            state.seed_life();
+        }
         let mut world = Self {
             state,
             slots: Vec::new(),
         };
         if config.run_climate {
             world.add_system(Box::new(ClimateSystem));
+        }
+        if config.run_life {
+            world.add_system(Box::new(LifeSystem));
         }
         Ok(world)
     }
@@ -351,6 +471,7 @@ impl World {
                 &before,
                 &self.state.terrain,
             );
+            self.state.life.terrain_changed(&self.state.terrain);
         }
         changed
     }
@@ -365,6 +486,7 @@ impl World {
             &before,
             &self.state.terrain,
         );
+        self.state.life.terrain_changed(&self.state.terrain);
     }
 
     /// Changes the player's evolution-speed settings; takes effect immediately.
@@ -372,6 +494,46 @@ impl World {
         evolution.validate()?;
         self.state.evolution = evolution;
         Ok(())
+    }
+
+    /// In daily-mean mode, runs one climate day in every `stride` while life
+    /// keeps stepping daily: the fast-forward for the microbial era. Seasons
+    /// are damped (the climate has less time to respond to them); annual
+    /// means are kept.
+    pub fn set_climate_stride(&mut self, stride: u32) {
+        let stride = stride.clamp(1, 30);
+        if self.state.climate_stride != stride {
+            self.state.climate_stride = stride;
+            self.reschedule();
+        }
+    }
+
+    /// Seeds base bacteria at the strongest vents. Returns the cells seeded.
+    pub fn seed_life(&mut self) -> Vec<CellId> {
+        self.state.seed_life()
+    }
+
+    /// Runs until `milestone` is reached, `max_years` planet years pass, or
+    /// `budget` of wall time is spent. Returns whether it was reached.
+    pub fn run_until_milestone(
+        &mut self,
+        milestone: Milestone,
+        max_years: f64,
+        budget: Option<Duration>,
+    ) -> bool {
+        let started = Instant::now();
+        let year_sim = self.state.calendar.year_length / self.state.time_model.season_speed;
+        let end = SimTime::from_seconds_ceil(self.state.now.seconds() + max_years * year_sim);
+        // Small chunks so the check happens often.
+        let chunk = LIFE_STEP / self.state.time_model.season_speed * 10.0;
+        while !self.state.life.has_reached(milestone) && self.state.now < end {
+            if budget.is_some_and(|b| started.elapsed() >= b) {
+                break;
+            }
+            let next = SimTime::from_seconds_ceil(self.state.now.seconds() + chunk).min(end);
+            self.run_until(next);
+        }
+        self.state.life.has_reached(milestone)
     }
 
     /// When the next system is due, if any.
@@ -467,6 +629,7 @@ mod tests {
             seed,
             grid_subdivision: 2,
             run_climate: false,
+            run_life: false,
             ..Default::default()
         })
         .unwrap();
@@ -585,6 +748,7 @@ mod tests {
     fn climate_runs_on_the_planet_clock_and_is_deterministic() {
         let config = WorldConfig {
             grid_subdivision: 6,
+            run_life: false,
             ..Default::default()
         };
         let run = || {

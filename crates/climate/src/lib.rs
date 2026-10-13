@@ -38,7 +38,7 @@ pub use stats::{ClimateZone, MonthlyStats, YearSummary};
 pub use wind::CirculationSummary;
 
 use physics::*;
-use transport::Geometry;
+pub use transport::Geometry;
 
 /// How often the circulation is recomputed, planet s.
 const WIND_INTERVAL: f64 = 6.0 * 3600.0;
@@ -312,6 +312,16 @@ impl Climate {
             ocean_water: 0.0,
             params,
         }
+    }
+
+    /// Where water flows on land (rebuilt when the terrain changes).
+    pub fn drainage(&self) -> &Drainage {
+        &self.drainage
+    }
+
+    /// Grid geometry in physical units (areas, edge lengths, neighbours).
+    pub fn geometry(&self) -> &Geometry {
+        &self.geo
     }
 
     pub fn cell_area(&self, cell: CellId) -> f64 {
